@@ -12,3 +12,6 @@ tinyvec = {git = "https://github.com/iantbutler01/tinyvec", branch="ian/bincode-
 marble = "15.0.7"
 bincode = "2.0.0-rc.3"
 thiserror = "1.0.47"
+
+[dev-dependencies]
+tempfile = "3.8.0"

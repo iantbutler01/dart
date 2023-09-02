@@ -44,6 +44,13 @@ pub(crate) struct NodeCache<T: 'static> {
 }
 
 impl<T: 'static + Encode + Decode> NodeCache<T> {
+    pub fn new(max_lru_cap: u64, num_lru_segments: usize, disk_location: String) -> Self {
+        Self {
+            lru: Arc::new(SegmentedCache::new(max_lru_cap, num_lru_segments)),
+            disk: Arc::new(marble::open(disk_location).unwrap()),
+        }
+    }
+
     pub fn get(&self, id: &u64) -> NodeWrapper<T> {
         self.lru.get(id).unwrap_or(self.load(id.clone()))
     }
@@ -128,12 +135,12 @@ impl<T> ArtNode<T> {
         }
     }
 
-    pub(crate) fn set_prefix(&mut self, p: &[u8]) {
-        let NodeData::Internal(ref mut data) = self.data else {
-            panic!("Leaf node!");
-        };
-        data.prefix = p.into();
-    }
+    // pub(crate) fn set_prefix(&mut self, p: &[u8]) {
+    //     let NodeData::Internal(ref mut data) = self.data else {
+    //         panic!("Leaf node!");
+    //     };
+    //     data.prefix = p.into();
+    // }
 
     pub(crate) fn new_leaf(key: Vec<u8>, value: T, id: usize, generation: usize) -> Self {
         Self {
@@ -160,13 +167,13 @@ impl<T> ArtNode<T> {
         data
     }
 
-    pub(crate) fn leaf_data_mut(&mut self) -> &mut LeafData<T> {
-        let NodeData::Leaf(ref mut data) = self.data else {
-            panic!("Internal node!");
-        };
+    // pub(crate) fn leaf_data_mut(&mut self) -> &mut LeafData<T> {
+    //     let NodeData::Leaf(ref mut data) = self.data else {
+    //         panic!("Internal node!");
+    //     };
 
-        data
-    }
+    //     data
+    // }
 
     pub(crate) fn leaf_data_ref(&self) -> &LeafData<T> {
         let NodeData::Leaf(ref data) = self.data else {
@@ -313,6 +320,10 @@ impl<T> ArtNode<T> {
                 data.children[pos]
             }
         }
+    }
+
+    pub(crate) fn is_leaf(&self) -> bool {
+        self.size == NodeSize::One
     }
 
     fn expand_48(&mut self) {

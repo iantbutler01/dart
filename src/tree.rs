@@ -10,16 +10,29 @@ use crate::errors::Errors;
 use crate::errors::OptimisticLockCouplingErrorType;
 
 pub struct Dart<T: 'static + Encode + Decode> {
-    root: AtomicCell<NodePtr>,
+    pub(crate) root: AtomicCell<NodePtr>,
     cache: Arc<NodeCache<T>>,
-    generation: AtomicUsize,
-    count: AtomicUsize,
+    pub generation: AtomicUsize,
+    pub count: AtomicUsize,
 }
 
 impl<T: Encode + Decode> Dart<T>
 where
     T: Clone,
 {
+    pub fn new(max_lru_cap: u64, num_lru_segments: usize, disk_location: String) -> Self {
+        Self {
+            root: AtomicCell::new(NodePtr::sentinel_node()),
+            cache: Arc::new(NodeCache::<T>::new(
+                max_lru_cap,
+                num_lru_segments,
+                disk_location,
+            )),
+            generation: AtomicUsize::new(0),
+            count: AtomicUsize::new(0),
+        }
+    }
+
     pub fn insert(&self, key: &[u8], value: T) -> Result<(), Errors> {
         let backoff = Backoff::new();
         loop {
@@ -76,18 +89,7 @@ where
             let read_guard = node_wrapper.data.read()?;
             let mut node = read_guard;
 
-            // Implement insertion starting with finding the nextNode if the prefix matches the current node for the given level.
-            let overlap = self.overlapping_prefix_len(&node, key);
-            if overlap != node.internal_data_ref().prefix.len() {
-                return Err(Errors::NonExistantError(
-                    "Unable to find key in tree.".to_string(),
-                ));
-            }
-            node.try_sync()?;
-
-            node = node_wrapper.data.read()?;
-
-            if node.size == NodeSize::One {
+            if node.is_leaf() {
                 if parent.is_some() {
                     let mut parent_mut = parent.as_ref().unwrap().data.write()?;
                     parent_mut.remove(key[level]);
@@ -101,6 +103,16 @@ where
                 return Ok(node.leaf_data_ref().value.clone());
             }
 
+            // Implement insertion starting with finding the nextNode if the prefix matches the current node for the given level.
+            let overlap = self.overlapping_prefix_len(&node, key);
+            if overlap != node.internal_data_ref().prefix.len() {
+                return Err(Errors::NonExistantError(
+                    "Unable to find key in tree.".to_string(),
+                ));
+            }
+
+            node.try_sync()?;
+            node = node_wrapper.data.read()?;
             next_node = node.get_child(key[level]);
             if next_node == NodePtr::sentinel_node() {
                 return Err(Errors::NonExistantError(
@@ -135,22 +147,7 @@ where
             let read_guard = node_wrapper.data.read()?;
             let mut node = read_guard;
 
-            let overlap = self.overlapping_prefix_len(&node, key);
-            if overlap != node.internal_data_ref().prefix.len() {
-                let _mut_node = node_wrapper.data.write()?;
-                let new_node = self.new_node(&key[0..overlap], NodeSize::Four);
-                let new_node_wrapper = self.fetch_node_wrapper(new_node);
-                let mut new_mut_node = new_node_wrapper.data.write()?;
-                let new_leaf = self.new_leaf(key, value);
-                new_mut_node.insert(key[overlap + level], new_leaf);
-                new_mut_node.insert(node.internal_data_ref().prefix[overlap], node_ptr);
-                return Ok(());
-            }
-            node.try_sync()?;
-
-            node = node_wrapper.data.read()?;
-
-            if node.size == NodeSize::One {
+            if node.is_leaf() {
                 if parent.is_some() {
                     parent.as_ref().unwrap().data.write()?;
                 }
@@ -177,6 +174,22 @@ where
                 new_mut_node.insert(key2[level], node_ptr);
                 return Ok(());
             }
+
+            let overlap = self.overlapping_prefix_len(&node, key);
+            if overlap != node.internal_data_ref().prefix.len() {
+                let _mut_node = node_wrapper.data.write()?;
+                let new_node = self.new_node(&key[0..overlap], NodeSize::Four);
+                let new_node_wrapper = self.fetch_node_wrapper(new_node);
+                let mut new_mut_node = new_node_wrapper.data.write()?;
+                let new_leaf = self.new_leaf(key, value);
+                new_mut_node.insert(key[overlap + level], new_leaf);
+                new_mut_node.insert(node.internal_data_ref().prefix[overlap], node_ptr);
+                return Ok(());
+            }
+
+            node.try_sync()?;
+            node = node_wrapper.data.read()?;
+
             next_node = node.get_child(key[level]);
             if next_node == NodePtr::sentinel_node() {
                 if node.is_full() {
@@ -242,7 +255,7 @@ where
         self.cache.as_ref().remove(ptr.id as u64);
     }
 
-    fn fetch_node_wrapper(&self, ptr: NodePtr) -> NodeWrapper<T> {
+    pub(crate) fn fetch_node_wrapper(&self, ptr: NodePtr) -> NodeWrapper<T> {
         self.cache.as_ref().get(&(ptr.id as u64))
     }
 
@@ -280,6 +293,10 @@ where
             let read_guard = node_wrapper.data.read()?;
             let mut node = read_guard;
 
+            if node.is_leaf() {
+                return Ok(node.leaf_data_ref().value.clone());
+            }
+
             // Implement insertion starting with finding the nextNode if the prefix matches the current node for the given level.
             let overlap = self.overlapping_prefix_len(&node, key);
             if overlap != node.internal_data_ref().prefix.len() {
@@ -287,13 +304,9 @@ where
                     "Unable to find key in tree.".to_string(),
                 ));
             }
+
             node.try_sync()?;
-
             node = node_wrapper.data.read()?;
-
-            if node.size == NodeSize::One {
-                return Ok(node.leaf_data_ref().value.clone());
-            }
 
             next_node = node.get_child(key[level]);
             if next_node == NodePtr::sentinel_node() {
@@ -307,7 +320,7 @@ where
         }
     }
 
-    fn overlapping_prefix_len(&self, node: &ArtNode<T>, key: &[u8]) -> usize {
+    pub(crate) fn overlapping_prefix_len(&self, node: &ArtNode<T>, key: &[u8]) -> usize {
         let mut count = 0;
         for i in 0..core::cmp::min(node.internal_data_ref().prefix.len(), key.len()) {
             if node.internal_data_ref().prefix[i] == key[i] {
@@ -324,4 +337,19 @@ where
 pub struct GDart<T: 'static + Encode + Decode> {
     current_generation: Dart<T>,
     past_generations: Vec<Dart<T>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tree::Dart;
+    use crate::utils::in_temp_dir;
+
+    #[test]
+    fn inserts_as_expected() {
+        in_temp_dir!(|path| {
+            let mut tree = Dart::<u64>::new(100, 1, path);
+
+            assert_eq!(2, 2);
+        })
+    }
 }

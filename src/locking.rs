@@ -10,7 +10,7 @@ use std::{fmt::Debug, sync::atomic::Ordering::*};
 /// Result type~
 pub type OptimisticLockCouplingResult<T> = Result<T, OptimisticLockCouplingErrorType>;
 /// Our data structure, the usage is 'pretty much' same as RwLock
-pub struct OptimisticLockCoupling<T: ?Sized> {
+pub(crate) struct OptimisticLockCoupling<T: ?Sized> {
     /// 60 bit for version | 1 bit for lock | 1 bit for outdate
     version_lock_outdate: AtomicU64,
     /// guard thread paniced
@@ -37,7 +37,7 @@ impl<T> OptimisticLockCoupling<T> {
     /// read transaction
     /// logic should be an inlined closure
     #[inline(always)]
-    pub fn read_txn<F, R>(&self, mut logic: F) -> OptimisticLockCouplingResult<R>
+    pub(crate) fn read_txn<F, R>(&self, mut logic: F) -> OptimisticLockCouplingResult<R>
     where
         F: FnMut(&OptimisticLockCouplingReadGuard<T>) -> OptimisticLockCouplingResult<R>,
     {
@@ -99,7 +99,7 @@ impl<T: ?Sized> OptimisticLockCoupling<T> {
     /// usually used when the container grows and this pointer point to this structure is replaced
     #[inline(always)]
     pub fn make_outdate(&self) {
-        self.version_lock_outdate.fetch_or(0b1, Release);
+        self.version_lock_outdate.fetch_or(0b10, Release);
     }
     /// is writter thread dead?
     /// if fail then fail ~
@@ -166,7 +166,7 @@ pub struct OptimisticLockCouplingReadGuard<'a, T: ?Sized + 'a> {
 }
 impl<'a, T: ?Sized> OptimisticLockCouplingReadGuard<'a, T> {
     #[inline(always)]
-    pub fn new(lock: &'a OptimisticLockCoupling<T>) -> OptimisticLockCouplingResult<Self> {
+    pub(crate) fn new(lock: &'a OptimisticLockCoupling<T>) -> OptimisticLockCouplingResult<Self> {
         use crate::locking::OptimisticLockCouplingErrorType::*;
         if lock.is_poisoned() {
             return Err(Poisoned);
@@ -248,7 +248,7 @@ impl<T: ?Sized> Drop for OptimisticLockCouplingWriteGuard<'_, T> {
         if std::thread::panicking() {
             self.lock.poisoned.fetch_or(true, Release);
         } else {
-            self.lock.version_lock_outdate.fetch_add(0b10, Release);
+            self.lock.make_outdate();
         }
     }
 }
@@ -276,7 +276,7 @@ impl<T: Debug + Display> Display for OptimisticLockCouplingWriteGuard<'_, T> {
 }
 impl<'a, T: ?Sized> OptimisticLockCouplingWriteGuard<'a, T> {
     #[inline(always)]
-    pub fn new(lock: &'a OptimisticLockCoupling<T>) -> Self {
+    pub(crate) fn new(lock: &'a OptimisticLockCoupling<T>) -> Self {
         Self { lock }
     }
 }
