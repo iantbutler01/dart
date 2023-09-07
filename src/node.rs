@@ -15,7 +15,7 @@ pub(crate) enum NodeSize {
     FourtyEight = 48,
     TwoFiftySix = 256,
 }
-
+#[derive(Debug)]
 pub(crate) struct NodeWrapper<T: 'static> {
     pub data: Arc<OptimisticLockCoupling<ArtNode<T>>>,
 }
@@ -52,7 +52,7 @@ impl<T: 'static + Encode + Decode> NodeCache<T> {
     }
 
     pub fn get(&self, id: &u64) -> NodeWrapper<T> {
-        self.lru.get(id).unwrap_or(self.load(id.clone()))
+        self.lru.get(id).unwrap_or_else(|| self.load(id.clone()))
     }
 
     fn load(&self, id: u64) -> NodeWrapper<T> {
@@ -73,38 +73,39 @@ impl<T: 'static + Encode + Decode> NodeCache<T> {
         NodeWrapper::new(node)
     }
 
-    pub(crate) fn remove(&self, key: u64) -> Option<NodeWrapper<T>> {
-        self.lru.remove(&key)
+    pub(crate) fn remove(&self, id: u64) -> Option<NodeWrapper<T>> {
+        self.lru.remove(&id)
     }
 
-    pub(crate) fn insert(&self, key: u64, value: NodeWrapper<T>) {
-        self.lru.insert(key, value)
+    pub(crate) fn insert(&self, id: u64, value: NodeWrapper<T>) {
+        self.lru.insert(id, value)
     }
 }
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Debug)]
 pub(crate) struct InternalData {
     pub(crate) children: Vec<NodePtr>,
     pub(crate) prefix: Vec<u8>,
     pub(crate) idx: Option<Vec<u8>>,
     pub(crate) count: usize,
     pub(crate) next_pos: u8,
+    pub(crate) terminal: NodePtr,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Debug)]
 pub(crate) struct LeafData<T> {
     pub(crate) value: T,
     pub(crate) key: Vec<u8>,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Debug)]
 pub(crate) enum NodeData<T> {
     Leaf(LeafData<T>),
     Internal(InternalData),
 }
 
-#[derive(Encode, Decode)]
-pub(crate) struct ArtNode<T> {
+#[derive(Encode, Decode, Debug)]
+pub struct ArtNode<T> {
     pub(crate) size: NodeSize,
     pub(crate) id: usize,
     pub(crate) generation: usize,
@@ -116,14 +117,15 @@ impl<T> ArtNode<T> {
         let mut node = Self {
             data: NodeData::Internal(InternalData {
                 prefix: prefix.into(),
-                idx: None,
-                children: Vec::with_capacity(NodeSize::One as usize),
+                idx: Some(vec![0; NodeSize::Four as usize]),
+                children: vec![NodePtr::sentinel_node(); NodeSize::Four as usize],
                 next_pos: 0,
                 count: 0,
+                terminal: NodePtr::sentinel_node(),
             }),
             id,
             generation,
-            size: NodeSize::One,
+            size: NodeSize::Four,
         };
 
         loop {
@@ -167,13 +169,13 @@ impl<T> ArtNode<T> {
         data
     }
 
-    // pub(crate) fn leaf_data_mut(&mut self) -> &mut LeafData<T> {
-    //     let NodeData::Leaf(ref mut data) = self.data else {
-    //         panic!("Internal node!");
-    //     };
+    pub(crate) fn leaf_data_mut(&mut self) -> &mut LeafData<T> {
+        let NodeData::Leaf(ref mut data) = self.data else {
+            panic!("Internal node!");
+        };
 
-    //     data
-    // }
+        data
+    }
 
     pub(crate) fn leaf_data_ref(&self) -> &LeafData<T> {
         let NodeData::Leaf(ref data) = self.data else {
@@ -191,11 +193,20 @@ impl<T> ArtNode<T> {
                 let NodeData::Internal(ref mut data) = self.data else {
                     panic!("Leaf node!");
                 };
-                let idx_mut = data.idx.as_mut().unwrap();
-                idx_mut.reserve_exact(size as usize - self.size as usize);
 
-                data.children
-                    .reserve_exact(size as usize - self.size as usize);
+                let idx_mut = data.idx.as_mut().unwrap();
+
+                let addnl = size as usize - self.size as usize;
+                idx_mut.reserve_exact(addnl);
+                for _ in 0..addnl {
+                    idx_mut.push(0);
+                }
+
+                data.children.reserve_exact(addnl);
+
+                for _ in 0..addnl {
+                    data.children.push(NodePtr::sentinel_node());
+                }
                 self.size = size;
             }
         }
@@ -310,14 +321,13 @@ impl<T> ArtNode<T> {
                 panic!("Leaf nodes do not have children.")
             }
             _ => {
-                let pos = data
-                    .idx
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .position(|x| *x == id)
-                    .unwrap();
-                data.children[pos]
+                let pos_opt = data.idx.as_ref().unwrap().iter().position(|x| *x == id);
+
+                if pos_opt.is_none() {
+                    NodePtr::sentinel_node()
+                } else {
+                    data.children[pos_opt.unwrap()]
+                }
             }
         }
     }
@@ -330,8 +340,8 @@ impl<T> ArtNode<T> {
         let NodeData::Internal(ref mut data) = self.data else {
             panic!("Leaf node!");
         };
-        let mut new_idx = Vec::<u8>::with_capacity(256);
-        let mut new_children = Vec::<NodePtr>::with_capacity(48);
+        let mut new_idx = vec![0; 256]; // Vec::<u8>::with_capacity(256);
+        let mut new_children = vec![NodePtr::sentinel_node(); NodeSize::FourtyEight as usize]; // Vec::<NodePtr>::with_capacity(48);
         let mut pos = 0;
 
         for (idx, key) in data.idx.as_ref().unwrap().iter().enumerate() {
@@ -353,7 +363,7 @@ impl<T> ArtNode<T> {
             panic!("Leaf node!");
         };
 
-        let mut new_vec = vec![NodePtr::sentinel_node(); 256];
+        let mut new_vec = vec![NodePtr::sentinel_node(); NodeSize::TwoFiftySix as usize];
 
         for (key, pos) in data.idx.as_ref().unwrap().iter().enumerate() {
             if *pos != EMPTY_SENTINEL {
@@ -504,7 +514,7 @@ impl<T> ArtNode<T> {
     }
 }
 
-#[derive(Encode, Decode, Clone, Copy, PartialEq, Eq)]
+#[derive(Encode, Decode, Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct NodePtr {
     pub(crate) id: usize,
     pub(crate) generation: usize,

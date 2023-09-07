@@ -10,6 +10,7 @@ use std::{fmt::Debug, sync::atomic::Ordering::*};
 /// Result type~
 pub type OptimisticLockCouplingResult<T> = Result<T, OptimisticLockCouplingErrorType>;
 /// Our data structure, the usage is 'pretty much' same as RwLock
+#[derive(Debug)]
 pub(crate) struct OptimisticLockCoupling<T: ?Sized> {
     /// 60 bit for version | 1 bit for lock | 1 bit for outdate
     version_lock_outdate: AtomicU64,
@@ -248,7 +249,7 @@ impl<T: ?Sized> Drop for OptimisticLockCouplingWriteGuard<'_, T> {
         if std::thread::panicking() {
             self.lock.poisoned.fetch_or(true, Release);
         } else {
-            self.lock.make_outdate();
+            self.lock.version_lock_outdate.fetch_add(0b10, Release);
         }
     }
 }

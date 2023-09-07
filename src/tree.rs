@@ -1,3 +1,4 @@
+use crate::locking::OptimisticLockCouplingWriteGuard;
 use crate::node::*;
 use bincode::{Decode, Encode};
 use crossbeam::atomic::AtomicCell;
@@ -134,6 +135,7 @@ where
         let mut node_ptr = self.root.load();
 
         if node_ptr == NodePtr::sentinel_node() {
+            println!("NO ROOT");
             let ptr = self.new_leaf(key, value);
             self.root.swap(ptr);
             return Ok(());
@@ -146,32 +148,69 @@ where
             let node_wrapper = self.cache.get(&(node_ptr.id as u64));
             let read_guard = node_wrapper.data.read()?;
             let mut node = read_guard;
+            println!("-------");
+            println!("{:?}", level);
 
             if node.is_leaf() {
                 if parent.is_some() {
                     parent.as_ref().unwrap().data.write()?;
                 }
-                let new_node = self.new_node(key, NodeSize::Four);
-                let mut_node = node_wrapper.data.write()?;
-                let new_node = self.fetch_node_wrapper(new_node);
+                let mut mut_node = node_wrapper.data.write()?;
+
+                if key == node.leaf_data_ref().key {
+                    mut_node.leaf_data_mut().value = value;
+                    return Ok(());
+                }
+
+                let new_node_ptr = self.new_node(key, NodeSize::Four);
+                let new_node = self.fetch_node_wrapper(new_node_ptr);
                 let mut new_mut_node = new_node.data.write()?;
                 let key2 = mut_node.leaf_data_ref().key.clone();
 
                 let mut i = level;
+
                 loop {
-                    if key[i] != key2[i] {
+                    if i >= key2.len() || key[i] != key2[i] {
                         break;
                     }
 
                     new_mut_node.internal_data_mut().prefix[i - level] = key[i];
-                    level = level + new_mut_node.internal_data_ref().prefix.len();
 
                     i += 1;
                 }
+                new_mut_node.internal_data_mut().prefix.resize(i, 0);
+                level = level + new_mut_node.internal_data_ref().prefix.len();
+                println!("------------");
+                println!("{:?}", key2);
+                println!("{:?}", key);
+                println!("{:?}", new_mut_node.internal_data_ref().prefix);
+                println!("{:?}", level);
+
+                if level < key2.len() {
+                    println!("{:?}", key2[level]);
+                }
+                println!("{:?}", key[level]);
+                println!("------------");
 
                 let new_leaf = self.new_leaf(key, value);
                 new_mut_node.insert(key[level], new_leaf);
-                new_mut_node.insert(key2[level], node_ptr);
+
+                // Handle cases where there is a leaf for a key that is also a prefix. e.g. Key "a" and Key "ap", in this case "a" is both a prefix and a valid terminal.
+                if level == key2.len() {
+                    new_mut_node.internal_data_mut().terminal = new_node_ptr;
+                } else {
+                    // Insert a pointer to its self, this is because we are about to swap the new node's ptr in the NodeCache and WAL with the parent, i.e. the current node.
+                    // This means ultimately it will point to the correct node after the swap.
+                    new_mut_node.insert(key2[level], new_node_ptr);
+                }
+
+                self.swap_node(
+                    mut_node,
+                    node_wrapper.clone(),
+                    new_mut_node,
+                    new_node.clone(),
+                );
+
                 return Ok(());
             }
 
@@ -211,6 +250,23 @@ where
             node_ptr = next_node;
             parent = Some(node_wrapper);
         }
+    }
+
+    fn swap_node(
+        &self,
+        mut parent: OptimisticLockCouplingWriteGuard<ArtNode<T>>,
+        parent_wrapper: NodeWrapper<T>,
+        mut child: OptimisticLockCouplingWriteGuard<ArtNode<T>>,
+        child_wrapper: NodeWrapper<T>,
+    ) {
+        let pid = parent.id;
+        let cid = child.id;
+
+        child.id = pid;
+        parent.id = cid;
+
+        self.cache.insert(pid as u64, child_wrapper);
+        self.cache.insert(cid as u64, parent_wrapper);
     }
 
     fn new_leaf(&self, key: &[u8], value: T) -> NodePtr {
@@ -259,11 +315,31 @@ where
         self.cache.as_ref().get(&(ptr.id as u64))
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<(), Errors> {
+    pub fn get(&self, key: &[u8]) -> Result<T, Errors> {
+        self.get_or_update_driver(key, None)
+    }
+
+    pub fn update(
+        &self,
+        key: &[u8],
+        callback: &mut Box<
+            dyn FnMut(OptimisticLockCouplingWriteGuard<ArtNode<T>>) -> Result<T, Errors>,
+        >,
+    ) -> Result<T, Errors> {
+        self.get_or_update_driver(key, Some(callback))
+    }
+
+    fn get_or_update_driver(
+        &self,
+        key: &[u8],
+        mut callback: Option<
+            &mut Box<dyn FnMut(OptimisticLockCouplingWriteGuard<ArtNode<T>>) -> Result<T, Errors>>,
+        >,
+    ) -> Result<T, Errors> {
         let backoff = Backoff::new();
         loop {
-            match self.get_internal(key) {
-                Ok(_) => return Ok(()),
+            match self.get_or_update_internal(key, &mut callback) {
+                Ok(value) => return Ok(value),
                 Err(get_error) => match get_error {
                     Errors::LockingError(e) => match e {
                         OptimisticLockCouplingErrorType::Outdated
@@ -278,7 +354,14 @@ where
             }
         }
     }
-    fn get_internal(&self, key: &[u8]) -> Result<T, Errors> {
+
+    fn get_or_update_internal(
+        &self,
+        key: &[u8],
+        callback: &mut Option<
+            &mut Box<dyn FnMut(OptimisticLockCouplingWriteGuard<ArtNode<T>>) -> Result<T, Errors>>,
+        >,
+    ) -> Result<T, Errors> {
         let mut node_ptr = self.root.load();
 
         if node_ptr == NodePtr::sentinel_node() {
@@ -293,8 +376,25 @@ where
             let read_guard = node_wrapper.data.read()?;
             let mut node = read_guard;
 
+            println!("{:?}", node.size);
+
             if node.is_leaf() {
-                return Ok(node.leaf_data_ref().value.clone());
+                if key == node.leaf_data_ref().key {
+                    return match callback {
+                        Some(cb) => {
+                            let write_lock = node_wrapper
+                                .data
+                                .write()
+                                .expect("Expected to acquire write lock.");
+                            cb(write_lock)
+                        }
+                        None => Ok(node.leaf_data_ref().value.clone()),
+                    };
+                } else {
+                    return Err(Errors::NonExistantError(
+                        "Key not found in tree.".to_string(),
+                    ));
+                }
             }
 
             // Implement insertion starting with finding the nextNode if the prefix matches the current node for the given level.
@@ -310,9 +410,29 @@ where
 
             next_node = node.get_child(key[level]);
             if next_node == NodePtr::sentinel_node() {
-                return Err(Errors::NonExistantError(
-                    "Unable to find key in tree.".to_string(),
-                ));
+                if key == node.internal_data_ref().prefix
+                    && node.internal_data_ref().terminal != NodePtr::sentinel_node()
+                {
+                    let data_wrapper = self
+                        .cache
+                        .get(&(node.internal_data_ref().terminal.id as u64));
+                    let data_node = data_wrapper.data.read().unwrap();
+
+                    return match callback {
+                        Some(cb) => {
+                            let write_lock = data_wrapper
+                                .data
+                                .write()
+                                .expect("Expected to acquire write lock.");
+                            cb(write_lock)
+                        }
+                        None => Ok(data_node.leaf_data_ref().value.clone()),
+                    };
+                } else {
+                    return Err(Errors::NonExistantError(
+                        "Unable to find key in tree.".to_string(),
+                    ));
+                }
             }
 
             level = level + 1;
@@ -341,15 +461,275 @@ pub struct GDart<T: 'static + Encode + Decode> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
+    use crate::errors::Errors;
     use crate::tree::Dart;
     use crate::utils::in_temp_dir;
 
     #[test]
-    fn inserts_as_expected() {
+    fn insert_at_root() {
         in_temp_dir!(|path| {
-            let mut tree = Dart::<u64>::new(100, 1, path);
+            let tree = Dart::<u64>::new(100, 1, path);
 
-            assert_eq!(2, 2);
+            let key = "abc".as_bytes();
+            let value = 64;
+
+            let res = tree
+                .insert(key, value)
+                .expect("Expected no error on insert.");
+            assert_eq!(res, ());
+        })
+    }
+
+    #[test]
+    fn insert_at_child() {
+        in_temp_dir!(|path| {
+            let tree = Dart::<u64>::new(100, 1, path);
+
+            let key = "aba".as_bytes();
+            let value = 64;
+
+            let res = tree
+                .insert(key, value)
+                .expect("Expected no error on insert.");
+            assert_eq!(res, ());
+
+            let key = "abb".as_bytes();
+            let value = 65;
+            tree.insert(key, value)
+                .expect("Expected no error on resize to 4.");
+            assert_eq!(res, ());
+        })
+    }
+
+    #[test]
+    fn insert_at_5th() {
+        in_temp_dir!(|path| {
+            let tree = Dart::<u64>::new(100, 1, path);
+
+            let key = "aba".as_bytes();
+            let value = 64;
+
+            let res = tree
+                .insert(key, value)
+                .expect("Expected no error on insert.");
+            assert_eq!(res, ());
+
+            for i in 1..5 {
+                let part = (i as u8) as char;
+                let fmt = format!("ab{}", part);
+                let key = fmt.as_bytes();
+                let value = i as u64;
+
+                let res = tree
+                    .insert(key, value)
+                    .expect(&format!("Expected no error on {i}th insert."));
+                assert_eq!(res, ());
+            }
+        })
+    }
+
+    #[test]
+    fn insert_at_17th() {
+        in_temp_dir!(|path| {
+            let tree = Dart::<u64>::new(100, 1, path);
+
+            let key = "aba".as_bytes();
+            let value = 64;
+
+            let res = tree
+                .insert(key, value)
+                .expect("Expected no error on insert.");
+            assert_eq!(res, ());
+
+            for i in 1..18 {
+                let part = (i as u8) as char;
+                let fmt = format!("ab{}", part);
+                let key = fmt.as_bytes();
+                let value = i as u64;
+
+                let res = tree
+                    .insert(key, value)
+                    .expect(&format!("Expected no error on {i}th insert."));
+                assert_eq!(res, ());
+            }
+        })
+    }
+
+    #[test]
+    fn insert_at_49th() {
+        in_temp_dir!(|path| {
+            let tree = Dart::<u64>::new(100, 1, path);
+
+            let key = "aba".as_bytes();
+            let value = 64;
+
+            let res = tree
+                .insert(key, value)
+                .expect("Expected no error on insert.");
+            assert_eq!(res, ());
+
+            for i in 0..98 {
+                let part = (i as u8) as char;
+                let fmt = format!("ab{}", part);
+                let key = fmt.as_bytes();
+                let value = i as u64;
+
+                let res = tree
+                    .insert(key, value)
+                    .expect(&format!("Expected no error on {i}th insert."));
+                assert_eq!(res, ());
+            }
+        })
+    }
+
+    #[test]
+    fn insert_multi_level() {
+        in_temp_dir!(|path| {
+            let tree = Dart::<u64>::new(100, 1, path);
+
+            let key = "aba".as_bytes();
+            let value = 64;
+
+            let res = tree
+                .insert(key, value)
+                .expect("Expected no error on insert.");
+            assert_eq!(res, ());
+
+            let key = "abb".as_bytes();
+            let value = 65;
+            let res = tree.insert(key, value).expect("Expected no error.");
+            assert_eq!(res, ());
+
+            for i in 0..4 {
+                let part = (i as u8) as char;
+                let fmt = format!("aba{}", part);
+                let key = fmt.as_bytes();
+                let value = i as u64;
+
+                let res = tree
+                    .insert(key, value)
+                    .expect(&format!("Expected no error on {i}th insert."));
+                assert_eq!(res, ());
+            }
+
+            for i in 0..255 {
+                let part = (i as u8) as char;
+                let fmt = format!("abb{}", part);
+                let key = fmt.as_bytes();
+                let value = i as u64;
+
+                let res = tree
+                    .insert(key, value)
+                    .expect(&format!("Expected no error on {i}th insert."));
+                assert_eq!(res, ());
+            }
+        })
+    }
+
+    #[test]
+    fn insert_words() {
+        in_temp_dir!(|path| {
+            let tree = Dart::<u64>::new(100, 1, path);
+
+            tree.insert("apple".as_bytes(), 1).unwrap();
+            tree.insert("appetizer".as_bytes(), 2).unwrap();
+            tree.insert("apply".as_bytes(), 3).unwrap();
+        })
+    }
+
+    #[test]
+    fn insert_deep() {
+        in_temp_dir!(|path| {
+            let tree = Dart::<u64>::new(100, 1, path);
+
+            let mut prev_key_str = "";
+            let mut fmt = "".to_string();
+
+            for i in 0..255 {
+                let part = (i as u8) as char;
+                fmt = format!("{}{}", prev_key_str, part);
+                let key = fmt.as_bytes();
+                let value = i as u64;
+
+                let res = tree
+                    .insert(key, value)
+                    .expect(&format!("Expected no error on {i}th insert."));
+                assert_eq!(res, ());
+                prev_key_str = fmt.as_str();
+                println!("NEW INSERT");
+            }
+        })
+    }
+
+    #[test]
+    #[ignore = "Inserts 65k elements, 50ish seconds to run."]
+    fn insert_deep_and_wide() {
+        in_temp_dir!(|path| {
+            let tree = Dart::<u64>::new(100, 1, path);
+
+            let mut prev_key_str = "";
+            let mut fmt = "".to_string();
+
+            for i in 0..255 {
+                let level_vec: Vec<u8> = (0..i).collect();
+                let level_chars: Vec<char> = level_vec.iter().map(|x| *x as char).collect();
+                let level_str = String::from_iter(level_chars);
+
+                for i in 0..255 {
+                    let part = (i as u8) as char;
+                    fmt = format!("{}{}{}", level_str, prev_key_str, part);
+                    let key = fmt.as_bytes();
+                    let value = i as u64;
+
+                    let res = tree
+                        .insert(key, value)
+                        .expect(&format!("Expected no error on {i}th insert."));
+                    assert_eq!(res, ());
+                    prev_key_str = fmt.as_str();
+                }
+            }
+
+            println!("TREE_COUNT: {}", tree.count.load(Ordering::Relaxed));
+            println!("TREE_COUNT: {}", tree.count.load(Ordering::Relaxed));
+            println!("TREE_COUNT: {}", tree.count.load(Ordering::Relaxed));
+            println!("TREE_COUNT: {}", tree.count.load(Ordering::Relaxed));
+            println!("TREE_COUNT: {}", tree.count.load(Ordering::Relaxed));
+        })
+    }
+
+    #[test]
+    fn get_element() {
+        in_temp_dir!(|path| {
+            let tree = Dart::<u64>::new(100, 1, path);
+
+            let mut prev_key_str = "";
+            let mut fmt = "".to_string();
+
+            for i in 0..10 {
+                let level_vec: Vec<u8> = (0..i).collect();
+                let level_chars: Vec<char> = level_vec.iter().map(|x| *x as char).collect();
+                let level_str = String::from_iter(level_chars);
+
+                for j in 0..10 {
+                    let part = (j as u8) as char;
+                    fmt = format!("{}{}{}", level_str, prev_key_str, part);
+                    let key = fmt.as_bytes();
+                    let value = j as u64;
+                    println!("{:?}", value);
+
+                    let res = tree
+                        .insert(key, value)
+                        .expect(&format!("Expected no error on {j}th insert."));
+                    assert_eq!(res, ());
+                    prev_key_str = fmt.as_str();
+                }
+            }
+
+            let res = tree.get(&[0, 1, 2, 3, 9]).expect("Expected result.");
+
+            assert_eq!(res, 4)
         })
     }
 }
