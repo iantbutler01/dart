@@ -4,7 +4,7 @@ use marble::Marble;
 use moka::sync::SegmentedCache;
 use std::sync::Arc;
 
-pub(crate) const EMPTY_SENTINEL: u8 = 255;
+pub(crate) const EMPTY_SENTINEL_IDX: u16 = 256;
 pub(crate) const EMPTY_POINTER_ID: usize = 0;
 
 #[derive(Encode, Decode, PartialEq, Debug, Copy, Clone)]
@@ -86,7 +86,7 @@ impl<T: 'static + Encode + Decode> NodeCache<T> {
 pub(crate) struct InternalData {
     pub(crate) children: Vec<NodePtr>,
     pub(crate) prefix: Vec<u8>,
-    pub(crate) idx: Option<Vec<u8>>,
+    pub(crate) idx: Option<Vec<u16>>,
     pub(crate) count: usize,
     pub(crate) next_pos: u8,
     pub(crate) terminal: NodePtr,
@@ -189,30 +189,43 @@ impl<T> ArtNode<T> {
         match self.newsize(true) {
             NodeSize::TwoFiftySix => self.expand_256(),
             NodeSize::FourtyEight => self.expand_48(),
-            size => {
+            NodeSize::Sixteen => {
                 let NodeData::Internal(ref mut data) = self.data else {
                     panic!("Leaf node!");
                 };
 
-                let idx_mut = data.idx.as_mut().unwrap();
+                let mut new_idx = vec![EMPTY_SENTINEL_IDX; 16];
+                let mut new_child = vec![NodePtr::sentinel_node(); 16];
 
-                let addnl = size as usize - self.size as usize;
-                idx_mut.reserve_exact(addnl);
-                for _ in 0..addnl {
-                    idx_mut.push(0);
+                for (idx, key) in data.idx.as_ref().unwrap().iter().enumerate() {
+                    if *key != EMPTY_SENTINEL_IDX {
+                        new_idx[idx] = *key;
+                        new_child[idx] = data.children[idx]
+                    }
                 }
 
-                data.children.reserve_exact(addnl);
-
-                for _ in 0..addnl {
-                    data.children.push(NodePtr::sentinel_node());
-                }
-                self.size = size;
+                self.size = NodeSize::Sixteen;
+                data.idx = Some(new_idx);
+                data.children = new_child;
             }
+            NodeSize::Four => {
+                let NodeData::Internal(ref mut data) = self.data else {
+                    panic!("Leaf node!");
+                };
+
+                let new_idx = vec![EMPTY_SENTINEL_IDX; 4];
+                let new_child = vec![NodePtr::sentinel_node(); 4];
+
+                self.size = NodeSize::Four;
+                data.idx = Some(new_idx);
+                data.children = new_child;
+            }
+            _ => panic!("Attempted to expand Leaf"),
         }
     }
 
     pub(crate) fn shrink(&mut self) {
+        println!("We callin, we ballin.");
         match self.newsize(false) {
             NodeSize::FourtyEight => self.shrink_48(),
             NodeSize::Sixteen => self.shrink_16(),
@@ -238,7 +251,19 @@ impl<T> ArtNode<T> {
         data.count == (self.size as usize)
     }
 
-    fn newsize(&mut self, updown: bool) -> NodeSize {
+    pub(crate) fn should_shrink(&self) -> bool {
+        let downsize = self.newsize(false);
+
+        println!("{:?}", downsize);
+
+        let NodeData::Internal(ref data) = self.data else {
+            panic!("Leaf node!");
+        };
+
+        data.count <= downsize as usize
+    }
+
+    fn newsize(&self, updown: bool) -> NodeSize {
         let mut old_size = self.size as isize;
         if old_size == 48 {
             old_size = 64
@@ -287,12 +312,13 @@ impl<T> ArtNode<T> {
 
         idx_mut.sort_unstable();
     }
+
     fn shrink_48(&mut self) {
         let NodeData::Internal(ref mut data) = self.data else {
             panic!("Leaf node!");
         };
         let mut count = 0;
-        let mut new_idx = Vec::<u8>::with_capacity(NodeSize::TwoFiftySix as usize);
+        let mut new_idx = Vec::<u16>::with_capacity(NodeSize::TwoFiftySix as usize);
         let mut new_children = Vec::<NodePtr>::with_capacity(NodeSize::TwoFiftySix as usize);
 
         for (key, node) in data.children.iter().enumerate() {
@@ -315,13 +341,23 @@ impl<T> ArtNode<T> {
             NodeSize::TwoFiftySix => data.children[id as usize],
             NodeSize::FourtyEight => {
                 let pos = data.idx.as_ref().unwrap()[id as usize];
-                data.children[pos as usize]
+
+                if pos >= NodeSize::FourtyEight as u16 {
+                    NodePtr::sentinel_node()
+                } else {
+                    data.children[pos as usize]
+                }
             }
             NodeSize::One => {
                 panic!("Leaf nodes do not have children.")
             }
             _ => {
-                let pos_opt = data.idx.as_ref().unwrap().iter().position(|x| *x == id);
+                let pos_opt = data
+                    .idx
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .position(|x| *x == id.into());
 
                 if pos_opt.is_none() {
                     NodePtr::sentinel_node()
@@ -340,15 +376,27 @@ impl<T> ArtNode<T> {
         let NodeData::Internal(ref mut data) = self.data else {
             panic!("Leaf node!");
         };
-        let mut new_idx = vec![0; 256]; // Vec::<u8>::with_capacity(256);
+        let mut new_idx = vec![EMPTY_SENTINEL_IDX; 256];
         let mut new_children = vec![NodePtr::sentinel_node(); NodeSize::FourtyEight as usize]; // Vec::<NodePtr>::with_capacity(48);
         let mut pos = 0;
 
-        for (idx, key) in data.idx.as_ref().unwrap().iter().enumerate() {
-            new_idx[*key as usize] = pos;
-            new_children[pos as usize] = data.children[idx];
-            pos += 1;
+        for key in data.idx.as_ref().unwrap().iter() {
+            if *key != EMPTY_SENTINEL_IDX {
+                new_idx[*key as usize] = pos;
+
+                let pos_opt = data.idx.as_ref().unwrap().iter().position(|x| *x == *key);
+
+                let child = if pos_opt.is_none() {
+                    NodePtr::sentinel_node()
+                } else {
+                    data.children[pos_opt.unwrap()]
+                };
+                new_children[pos as usize] = child;
+                pos += 1;
+            }
         }
+
+        data.next_pos = pos as u8;
 
         data.idx = Some(new_idx);
         data.children = new_children;
@@ -366,7 +414,7 @@ impl<T> ArtNode<T> {
         let mut new_vec = vec![NodePtr::sentinel_node(); NodeSize::TwoFiftySix as usize];
 
         for (key, pos) in data.idx.as_ref().unwrap().iter().enumerate() {
-            if *pos != EMPTY_SENTINEL {
+            if *pos != EMPTY_SENTINEL_IDX {
                 let child = data.children[*pos as usize];
 
                 new_vec[key] = child;
@@ -389,10 +437,6 @@ impl<T> ArtNode<T> {
             _ => self.remove_sleq16(key),
         };
 
-        if size <= self.newsize(false) as usize {
-            self.shrink()
-        }
-
         ptr
     }
 
@@ -406,7 +450,7 @@ impl<T> ArtNode<T> {
             .as_ref()
             .unwrap()
             .iter()
-            .position(|x| *x == key)
+            .position(|x| *x == key.into())
             .unwrap();
 
         data.idx.as_mut().unwrap()[pos] = 0;
@@ -428,7 +472,7 @@ impl<T> ArtNode<T> {
         let old = data.children[pos as usize];
         data.children[pos as usize] = NodePtr::sentinel_node();
 
-        data.next_pos = pos;
+        data.next_pos = pos as u8;
         data.count -= 1;
 
         (old, data.count)
@@ -466,8 +510,20 @@ impl<T> ArtNode<T> {
         let NodeData::Internal(ref mut data) = self.data else {
             panic!("Leaf node!");
         };
-        data.idx.as_mut().unwrap()[key as usize] = data.next_pos;
-        data.children[data.next_pos as usize] = ptr;
+
+        let mut pos = data.next_pos;
+
+        loop {
+            if data.children[data.next_pos as usize] != NodePtr::sentinel_node() {
+                pos += 1;
+            } else {
+                data.idx.as_mut().unwrap()[key as usize] = pos as u16;
+                data.children[pos as usize] = ptr;
+                break;
+            }
+        }
+
+        data.next_pos = pos + 1;
     }
 
     fn _insert(&mut self, key: u8, ptr: NodePtr) {
@@ -475,12 +531,10 @@ impl<T> ArtNode<T> {
             panic!("Leaf node!");
         };
         let idx_mut = data.idx.as_mut().unwrap();
-        idx_mut.push(key);
-        //This needs to be sorted, pick up on it tomorrow.
         let mut pos: usize = 0;
 
         while pos < data.count {
-            if idx_mut[pos] < key {
+            if idx_mut[pos] < key as u16 {
                 pos += 1;
                 continue;
             } else {
@@ -502,7 +556,7 @@ impl<T> ArtNode<T> {
             );
         }
 
-        idx_mut[pos] = key;
+        idx_mut[pos] = key as u16;
         data.children[pos] = ptr;
     }
 
