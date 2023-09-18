@@ -2,7 +2,8 @@ use crate::locking::*;
 use bincode::{config, Decode, Encode};
 use marble::Marble;
 use moka::sync::SegmentedCache;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 pub(crate) const EMPTY_SENTINEL_IDX: u16 = 256;
 pub(crate) const EMPTY_POINTER_ID: usize = 0;
@@ -35,20 +36,110 @@ impl<T> Clone for NodeWrapper<T> {
         }
     }
 }
+
 unsafe impl<T> Send for NodeWrapper<T> {}
 unsafe impl<T> Sync for NodeWrapper<T> {}
 
+#[derive(Encode, Decode)]
+enum OpType {
+    Insert,
+    Remove,
+}
+
+#[derive(Encode, Decode)]
+pub(crate) struct Op<T> {
+    optype: OpType,
+    key: Vec<u8>,
+    value: Option<T>,
+    id: usize,
+}
+
+pub(crate) struct WriteAheadLog {
+    count: usize,
+    ops: Vec<(usize, Vec<u8>)>,
+    flushat: usize,
+    receiver: mpsc::Receiver<(usize, Vec<u8>)>,
+    disk: Marble,
+}
+
+impl WriteAheadLog {
+    fn new(flushat: usize, path: String, receiver: mpsc::Receiver<(usize, Vec<u8>)>) -> Self {
+        Self {
+            count: 0,
+            ops: Vec::new(),
+            flushat,
+            receiver,
+            disk: marble::open(path).expect("Expected WAL disk path to open without issue."),
+        }
+    }
+
+    fn append(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let op = self.receiver.recv()?;
+
+        self.ops.push(op);
+
+        self.count += 1;
+
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.ops.len() >= self.flushat {
+            let batch = self.ops.iter().map(|(id, op)| (*id as u64, Some(op)));
+            self.disk.write_batch(batch)?;
+            if self.count % 100 == 0 {
+                self.disk.maintenance()?;
+            }
+
+            if self.count % 1000 == 0 {
+                let range_iter = ((self.count - 1000)..self.count).into_iter();
+
+                let batch: Vec<(u64, Option<Vec<u8>>)> =
+                    range_iter.map(|i| (i as u64, None)).collect();
+
+                self.disk.write_batch(batch)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct NodeCache<T: 'static> {
     lru: Arc<SegmentedCache<u64, NodeWrapper<T>>>,
+    log: Arc<mpsc::Sender<(usize, Vec<u8>)>>,
     disk: Arc<Marble>,
 }
 
 impl<T: 'static + Encode + Decode> NodeCache<T> {
-    pub fn new(max_lru_cap: u64, num_lru_segments: usize, disk_location: String) -> Self {
+    pub fn new(
+        max_lru_cap: u64,
+        num_lru_segments: usize,
+        disk_path: String,
+        wal_path: String,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut wal = WriteAheadLog::new(10, wal_path, rx);
+            loop {
+                wal.append().expect("Expected appending to WAL to succeed.");
+                wal.flush().expect("Expected flushing WAL to complete.");
+            }
+        });
+
         Self {
             lru: Arc::new(SegmentedCache::new(max_lru_cap, num_lru_segments)),
-            disk: Arc::new(marble::open(disk_location).unwrap()),
+            disk: Arc::new(marble::open(disk_path).unwrap()),
+            log: Arc::new(tx),
         }
+    }
+
+    fn write<U: Encode + Decode>(&self, op: Op<U>) -> Result<(), Box<dyn std::error::Error>> {
+        let id = op.id.clone();
+        let encoded = bincode::encode_to_vec(op, config::standard())?;
+
+        self.log.send((id, encoded))?;
+
+        Ok(())
     }
 
     pub fn get(&self, id: &u64) -> NodeWrapper<T> {
@@ -137,13 +228,6 @@ impl<T> ArtNode<T> {
         }
     }
 
-    // pub(crate) fn set_prefix(&mut self, p: &[u8]) {
-    //     let NodeData::Internal(ref mut data) = self.data else {
-    //         panic!("Leaf node!");
-    //     };
-    //     data.prefix = p.into();
-    // }
-
     pub(crate) fn new_leaf(key: Vec<u8>, value: T, id: usize, generation: usize) -> Self {
         Self {
             id,
@@ -225,7 +309,6 @@ impl<T> ArtNode<T> {
     }
 
     pub(crate) fn shrink(&mut self) {
-        println!("We callin, we ballin.");
         match self.newsize(false) {
             NodeSize::FourtyEight => self.shrink_48(),
             NodeSize::Sixteen => self.shrink_16(),
@@ -253,8 +336,6 @@ impl<T> ArtNode<T> {
 
     pub(crate) fn should_shrink(&self) -> bool {
         let downsize = self.newsize(false);
-
-        println!("{:?}", downsize);
 
         let NodeData::Internal(ref data) = self.data else {
             panic!("Leaf node!");
@@ -317,20 +398,24 @@ impl<T> ArtNode<T> {
         let NodeData::Internal(ref mut data) = self.data else {
             panic!("Leaf node!");
         };
-        let mut count = 0;
-        let mut new_idx = Vec::<u16>::with_capacity(NodeSize::TwoFiftySix as usize);
-        let mut new_children = Vec::<NodePtr>::with_capacity(NodeSize::TwoFiftySix as usize);
+        let mut new_idx = vec![EMPTY_SENTINEL_IDX; 256];
+        let mut new_children = vec![NodePtr::sentinel_node(); NodeSize::FourtyEight as usize]; // Vec::<NodePtr>::with_capacity(48);
+        let mut pos = 0;
 
-        for (key, node) in data.children.iter().enumerate() {
-            if node.id != EMPTY_POINTER_ID {
-                new_idx[key as usize] = count;
-                new_children[count as usize] = *node;
-                count += 1;
+        for (key, value) in data.children.iter().enumerate() {
+            if *value != NodePtr::sentinel_node() {
+                new_idx[key] = pos;
+
+                new_children[pos as usize] = *value;
+                pos += 1;
             }
         }
 
+        data.next_pos = pos as u8;
+
         data.idx = Some(new_idx);
         data.children = new_children;
+        self.size = NodeSize::FourtyEight;
     }
 
     pub(crate) fn get_child(&self, id: u8) -> NodePtr {
@@ -430,7 +515,7 @@ impl<T> ArtNode<T> {
         if self.size == NodeSize::One {
             panic!("Tried removing from a Leaf!");
         }
-        let (ptr, size) = match self.size {
+        let (ptr, _size) = match self.size {
             NodeSize::TwoFiftySix => self.remove256(key),
             NodeSize::FourtyEight => self.remove48(key),
             NodeSize::One => panic!("Trying to remove from a leaf!"),

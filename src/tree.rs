@@ -16,23 +16,31 @@ pub struct Dart<T: 'static + Encode + Decode> {
     pub generation: AtomicUsize,
     pub count: AtomicUsize,
     pub levels: AtomicUsize,
+    pub ops: AtomicUsize,
 }
 
 impl<T: Encode + Decode> Dart<T>
 where
     T: Clone,
 {
-    pub fn new(max_lru_cap: u64, num_lru_segments: usize, disk_location: String) -> Self {
+    pub fn new(
+        max_lru_cap: u64,
+        num_lru_segments: usize,
+        disk_path: String,
+        wal_path: String,
+    ) -> Self {
         let tree = Self {
             root: AtomicCell::new(NodePtr::sentinel_node()),
             cache: Arc::new(NodeCache::<T>::new(
                 max_lru_cap,
                 num_lru_segments,
-                disk_location,
+                disk_path,
+                wal_path,
             )),
             generation: AtomicUsize::new(0),
             count: AtomicUsize::new(0),
             levels: AtomicUsize::new(1),
+            ops: AtomicUsize::new(0),
         };
 
         let root = tree.new_node(&[], NodeSize::TwoFiftySix);
@@ -112,7 +120,6 @@ where
                         parent_mut.remove(key[level]);
                     }
 
-                    println!("HERE");
                     if parent_mut.internal_data_ref().prefix != [] && parent_mut.should_shrink() {
                         parent_mut.shrink();
                     }
@@ -135,6 +142,20 @@ where
 
             node.try_sync()?;
             node = node_wrapper.data.read()?;
+            if level >= key.len() && node.internal_data_ref().terminal != NodePtr::sentinel_node() {
+                let terminal_wrapper = self
+                    .cache
+                    .get(&(node.internal_data_ref().terminal.id as u64));
+
+                let terminal = terminal_wrapper.data.read()?;
+
+                let mut node_mut = node_wrapper.data.write()?;
+                node_mut.internal_data_mut().terminal = NodePtr::sentinel_node();
+                self.cache.remove(terminal.id as u64);
+
+                return Ok(terminal.leaf_data_ref().value.clone());
+            }
+
             next_node = node.get_child(key[level]);
             if next_node == NodePtr::sentinel_node() {
                 if key == node.internal_data_ref().prefix
@@ -265,7 +286,16 @@ where
 
             node.try_sync()?;
             node = node_wrapper.data.read()?;
-            level = level + node.internal_data_ref().prefix.len();
+            level = level + overlap;
+
+            if level >= key.len() && node.internal_data_ref().terminal == NodePtr::sentinel_node() {
+                let mut node_mut = node_wrapper.data.write()?;
+                let new_leaf_node = self.new_leaf(key, value);
+
+                node_mut.internal_data_mut().terminal = new_leaf_node;
+
+                return Ok(());
+            }
 
             next_node = node.get_child(key[level]);
 
@@ -504,7 +534,10 @@ where
     }
 }
 
-pub struct GDart<T: 'static + Encode + Decode> {
+pub struct GDart<T: 'static + Encode + Decode>
+where
+    T: Send + Clone,
+{
     current_generation: Dart<T>,
     past_generations: Vec<Dart<T>>,
 }
@@ -521,8 +554,8 @@ mod tests {
 
     #[test]
     fn insert_at_root() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(100, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path.clone() + "/wal");
 
             let key = "abc".as_bytes();
             let value = 64;
@@ -536,8 +569,8 @@ mod tests {
 
     #[test]
     fn insert_at_child() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(100, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
 
             let key = "aba".as_bytes();
             let value = 64;
@@ -557,9 +590,34 @@ mod tests {
     }
 
     #[test]
+    fn insert_non_primitive() {
+        use std::collections::HashMap;
+
+        in_temp_dir!(|path: String| {
+            let tree =
+                Dart::<HashMap<String, String>>::new(100, 1, path.clone() + "/tree", path + "/wal");
+
+            let key = "aba".as_bytes();
+            let value = HashMap::<String, String>::new();
+
+            let res = tree
+                .insert(key, value)
+                .expect("Expected no error on insert.");
+            assert_eq!(res, ());
+
+            let key = "abb".as_bytes();
+            let value = HashMap::<String, String>::new();
+            tree.insert(key, value)
+                .expect("Expected no error on resize to 4.");
+            assert_eq!(res, ());
+            assert_eq!(tree.levels.load(Ordering::Relaxed), 2);
+        })
+    }
+
+    #[test]
     fn insert_at_5th() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(100, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
 
             let key = "aba".as_bytes();
             let value = 64;
@@ -585,19 +643,35 @@ mod tests {
     }
 
     #[test]
+    fn remove_at_5th() {
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+
+            let mut key: &[u8] = &[];
+            let mut fmt: String;
+
+            for i in 0..5 {
+                let part = (i as u8) as char;
+                fmt = format!("ab{}", part);
+                key = fmt.as_bytes().clone();
+                let value = i as u64;
+
+                let res = tree
+                    .insert(key, value)
+                    .expect(&format!("Expected no error on {i}th insert."));
+                assert_eq!(res, ());
+            }
+
+            tree.remove(key).expect("Expected this to not explode.");
+        })
+    }
+
+    #[test]
     fn insert_at_17th() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(100, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
 
-            let key = "aba".as_bytes();
-            let value = 64;
-
-            let res = tree
-                .insert(key, value)
-                .expect("Expected no error on insert.");
-            assert_eq!(res, ());
-
-            for i in 1..=18 {
+            for i in 0..=17 {
                 let part = (i as u8) as char;
                 let fmt = format!("ab{}", part);
                 let key = fmt.as_bytes();
@@ -613,9 +687,33 @@ mod tests {
     }
 
     #[test]
+    fn remove_at_17th() {
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+
+            let mut key: &[u8] = &[];
+            let mut fmt: String;
+
+            for i in 0..17 {
+                let part = (i as u8) as char;
+                fmt = format!("ab{}", part);
+                key = fmt.as_bytes().clone();
+                let value = i as u64;
+
+                let res = tree
+                    .insert(key, value)
+                    .expect(&format!("Expected no error on {i}th insert."));
+                assert_eq!(res, ());
+            }
+
+            tree.remove(key).expect("Expected this to not explode.");
+        })
+    }
+
+    #[test]
     fn insert_at_49th() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(100, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
 
             let key = "aba".as_bytes();
             let value = 64;
@@ -643,21 +741,12 @@ mod tests {
 
     #[test]
     fn remove_at_49th() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(100, 1, path);
-
-            let key = "aba".as_bytes();
-            let value = 64;
-
-            let res = tree
-                .insert(key, value)
-                .expect("Expected no error on insert.");
-            assert_eq!(res, ());
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
 
             let mut key: &[u8] = &[];
             let mut fmt: String;
 
-            let mut count = 0;
             for i in 0..49 {
                 let part = (i as u8) as char;
                 fmt = format!("ab{}", part);
@@ -668,12 +757,7 @@ mod tests {
                     .insert(key, value)
                     .expect(&format!("Expected no error on {i}th insert."));
                 assert_eq!(res, ());
-                count += 1;
             }
-
-            println!("{:?}", count);
-
-            println!("{:?}", key);
 
             tree.remove(key).expect("Expected this to not explode.");
 
@@ -683,8 +767,8 @@ mod tests {
 
     #[test]
     fn insert_multi_level() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(100, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
 
             let key = vec![1, 2, 3];
             let value = 64;
@@ -726,8 +810,8 @@ mod tests {
 
     #[test]
     fn insert_words() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(100, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
 
             tree.insert("apple".as_bytes(), 1).unwrap();
             tree.insert("appetizer".as_bytes(), 2).unwrap();
@@ -747,8 +831,8 @@ mod tests {
 
     #[test]
     fn insert_deep() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(600, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
 
             let mut prev_key = Vec::<u8>::new();
 
@@ -766,8 +850,8 @@ mod tests {
 
     #[test]
     fn insert_deep_and_wide() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(200000, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
 
             for i in 0..=255 {
                 let level_vec: Vec<u8> = (0..i).collect();
@@ -788,8 +872,8 @@ mod tests {
 
     #[test]
     fn get_element_when_exists() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(100, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
 
             for i in 0..10 {
                 let level_vec: Vec<u8> = (0..i).collect();
@@ -814,8 +898,8 @@ mod tests {
 
     #[test]
     fn get_element_when_not_exists() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(100, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
 
             for i in 0..10 {
                 let level_vec: Vec<u8> = (0..i).collect();
@@ -847,9 +931,39 @@ mod tests {
     }
 
     #[test]
+    fn insert_terminal_remove_terminal_insert_terminal() {
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path.clone() + "/wal");
+
+            for i in 0..=10 {
+                let level_vec: Vec<u8> = (0..i).collect();
+
+                for i in 0..=10 {
+                    let mut current_vec = level_vec.clone();
+                    current_vec.push(i);
+                    let value = i as u64;
+
+                    let res = tree
+                        .insert(&current_vec, value)
+                        .expect(&format!("Expected no error on {i}th insert."));
+                    assert_eq!(res, ());
+                }
+            }
+
+            let test_key = &[0, 1, 2, 3, 4, 5];
+
+            tree.remove(test_key)
+                .expect("Expected this to remove correctly.");
+
+            tree.insert(test_key, 64)
+                .expect("Expected this to insert correctly.");
+        })
+    }
+
+    #[test]
     fn insert_many_random_removal() {
-        in_temp_dir!(|path| {
-            let tree = Dart::<u64>::new(200000, 1, path);
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path.clone() + "/wal");
 
             for i in 0..=255 {
                 let level_vec: Vec<u8> = (0..i).collect();
@@ -876,7 +990,6 @@ mod tests {
                     if remove > 0.9 {
                         let mut current_vec = level_vec.clone();
                         current_vec.push(i);
-                        println!("Removing {:?}", current_vec);
 
                         let res = tree
                             .remove(&current_vec)

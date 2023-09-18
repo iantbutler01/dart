@@ -32,7 +32,7 @@ impl<'a> Range<'a> {
 
     pub fn scan<T>(&mut self, tree: &Dart<T>) -> Result<ScanResult<T>, Errors>
     where
-        T: Encode + Decode + Clone,
+        T: Encode + Decode + Clone + Send,
     {
         let root = tree.root.load();
         let state = RangeState {
