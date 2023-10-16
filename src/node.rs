@@ -1,9 +1,18 @@
+use crate::errors::Errors;
+use crate::errors::OptimisticLockCouplingErrorType;
 use crate::locking::*;
 use bincode::{config, Decode, Encode};
+use core::num;
+use crossbeam::utils::Backoff;
 use marble::Marble;
+use moka::notification::RemovalCause;
 use moka::sync::SegmentedCache;
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::TryRecvError;
+use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::thread::{self, JoinHandle, Thread};
+use std::time::Duration;
 
 pub(crate) const EMPTY_SENTINEL_IDX: u16 = 256;
 pub(crate) const EMPTY_POINTER_ID: usize = 0;
@@ -41,29 +50,34 @@ unsafe impl<T> Send for NodeWrapper<T> {}
 unsafe impl<T> Sync for NodeWrapper<T> {}
 
 #[derive(Encode, Decode)]
-enum OpType {
+pub(crate) enum OpType {
     Insert,
     Remove,
 }
 
 #[derive(Encode, Decode)]
 pub(crate) struct Op<T> {
-    optype: OpType,
-    key: Vec<u8>,
-    value: Option<T>,
-    id: usize,
+    pub(crate) optype: OpType,
+    pub(crate) value: Option<T>,
+    pub(crate) key: Vec<u8>,
+}
+
+impl<T: Encode + Decode> Op<T> {
+    fn new(optype: OpType, key: Vec<u8>, value: Option<T>) -> Self {
+        Self { optype, key, value }
+    }
 }
 
 pub(crate) struct WriteAheadLog {
     count: usize,
-    ops: Vec<(usize, Vec<u8>)>,
+    ops: Vec<(u64, Vec<u8>)>,
     flushat: usize,
-    receiver: mpsc::Receiver<(usize, Vec<u8>)>,
+    receiver: mpsc::Receiver<Vec<u8>>,
     disk: Marble,
 }
 
 impl WriteAheadLog {
-    fn new(flushat: usize, path: String, receiver: mpsc::Receiver<(usize, Vec<u8>)>) -> Self {
+    fn new(flushat: usize, path: String, receiver: mpsc::Receiver<Vec<u8>>) -> Self {
         Self {
             count: 0,
             ops: Vec::new(),
@@ -74,11 +88,17 @@ impl WriteAheadLog {
     }
 
     fn append(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let op = self.receiver.recv()?;
+        match self.receiver.try_recv() {
+            Ok(op) => {
+                self.ops.push((self.count as u64, op));
 
-        self.ops.push(op);
-
-        self.count += 1;
+                self.count += 1;
+            }
+            Err(recv_error) => match recv_error {
+                mpsc::TryRecvError::Empty => (),
+                mpsc::TryRecvError::Disconnected => return Err(Box::new(recv_error)),
+            },
+        }
 
         Ok(())
     }
@@ -105,75 +125,247 @@ impl WriteAheadLog {
 }
 
 pub(crate) struct NodeCache<T: 'static> {
-    lru: Arc<SegmentedCache<u64, NodeWrapper<T>>>,
-    log: Arc<mpsc::Sender<(usize, Vec<u8>)>>,
-    disk: Arc<Marble>,
+    pub(crate) lru: Arc<Mutex<SegmentedCache<u64, NodeWrapper<T>>>>,
+    log: mpsc::Sender<Vec<u8>>,
+    write_cache: Arc<Mutex<VecDeque<(u64, Option<Vec<u8>>)>>>,
+    disk: Marble,
+    thread_exit_signal: Arc<AtomicBool>,
+    threads: [Option<JoinHandle<()>>; 2],
 }
 
-impl<T: 'static + Encode + Decode> NodeCache<T> {
-    pub fn new(
+impl<T: 'static> Drop for NodeCache<T> {
+    fn drop(&mut self) {
+        self.thread_exit_signal
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        for thread in self.threads.iter_mut() {
+            thread
+                .take()
+                .expect("Expected thread handle.")
+                .join()
+                .expect("Expected thread join not to fail.");
+        }
+    }
+}
+
+impl<T: 'static + Encode + Decode> NodeCache<T>
+where
+    T: Clone,
+{
+    pub(crate) fn new(
         max_lru_cap: u64,
         num_lru_segments: usize,
         disk_path: String,
         wal_path: String,
     ) -> Self {
+        let exit_signal = Arc::new(AtomicBool::new(false));
+        let signal_clone = exit_signal.clone();
+        let signal_clone2 = exit_signal.clone();
+
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut wal = WriteAheadLog::new(10, wal_path, rx);
+        let wal_handle = thread::spawn(move || {
+            let exit_signal = signal_clone;
+            let mut wal = WriteAheadLog::new(100, wal_path, rx);
             loop {
-                wal.append().expect("Expected appending to WAL to succeed.");
+                match wal.append() {
+                    Ok(_) => (),
+                    Err(e) => {
+                        let recv_error = e.downcast_ref::<mpsc::TryRecvError>();
+
+                        if recv_error.is_some() {
+                            break;
+                        }
+
+                        panic!("Expected wal append to succeed!")
+                    }
+                }
                 wal.flush().expect("Expected flushing WAL to complete.");
+
+                if exit_signal.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+            }
+        });
+        let write_cache = Arc::new(Mutex::new(
+            VecDeque::<(u64, Option<Vec<u8>>)>::with_capacity(1000),
+        ));
+        let wc_ref = write_cache.clone();
+
+        let disk = marble::open(disk_path).unwrap();
+        let disk_ref = disk.clone();
+
+        let write_handle = thread::spawn(move || {
+            let disk = disk_ref;
+            let exit_signal = signal_clone2;
+            let mut count = 0;
+            loop {
+                let mut wc_lock = wc_ref.lock().expect("Expected to acquire write lock");
+                let cache_empty = wc_lock.is_empty();
+
+                if !cache_empty {
+                    disk.write_batch(
+                        wc_lock
+                            .iter()
+                            .cloned()
+                            .rev()
+                            .collect::<Vec<(u64, Option<Vec<u8>>)>>(),
+                    )
+                    .expect("Expect write to disk to succeed.");
+                    wc_lock.clear();
+
+                    count += 1;
+                }
+                drop(wc_lock);
+
+                if count >= 10000 {
+                    count = 0;
+                    disk.maintenance()
+                        .expect("Expected disk maintenence to complete.");
+                }
+
+                if exit_signal.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+
+                thread::sleep(Duration::from_millis(10));
             }
         });
 
+        let evl_write_cache_handle = write_cache.clone();
+
+        let eviction_listener = move |k: Arc<u64>, v: NodeWrapper<T>, cause| {
+            if cause == RemovalCause::Replaced {
+                return;
+            }
+            let backoff = Backoff::new();
+            loop {
+                match v.data.write() {
+                    Ok(lock) => {
+                        let node = lock.clone();
+                        // println!("WC ID: {:?} NODE: {:?}", k, node.id);
+                        let option = Some(node);
+
+                        let encoded = option.map(|x| {
+                            bincode::encode_to_vec(x.clone(), config::standard())
+                                .expect("Expected encoding for disk write to succeed.")
+                        });
+                        let mut cache_lock = evl_write_cache_handle.lock().unwrap();
+                        cache_lock.push_front((*k, encoded));
+                        break;
+                    }
+                    Err(insert_error) => match insert_error {
+                        OptimisticLockCouplingErrorType::Blocked => {
+                            break;
+                        }
+                        e => {
+                            println!("E: {:?}", e);
+                            backoff.spin();
+                            continue;
+                        }
+                    },
+                }
+            }
+        };
+
+        let lru = SegmentedCache::builder(num_lru_segments)
+            .max_capacity(max_lru_cap)
+            .eviction_listener(eviction_listener)
+            .build();
+
         Self {
-            lru: Arc::new(SegmentedCache::new(max_lru_cap, num_lru_segments)),
-            disk: Arc::new(marble::open(disk_path).unwrap()),
-            log: Arc::new(tx),
+            lru: Arc::new(Mutex::new(lru)),
+            write_cache,
+            log: tx,
+            disk,
+            threads: [Some(wal_handle), Some(write_handle)],
+            thread_exit_signal: exit_signal.clone(),
         }
     }
 
-    fn write<U: Encode + Decode>(&self, op: Op<U>) -> Result<(), Box<dyn std::error::Error>> {
-        let id = op.id.clone();
+    pub(crate) fn write_wal(&self, op: Op<T>) -> Result<(), Box<dyn std::error::Error>> {
         let encoded = bincode::encode_to_vec(op, config::standard())?;
 
-        self.log.send((id, encoded))?;
+        self.log.send(encoded)?;
 
         Ok(())
     }
 
-    pub fn get(&self, id: &u64) -> NodeWrapper<T> {
-        self.lru.get(id).unwrap_or_else(|| self.load(id.clone()))
+    pub(crate) fn write_disk(
+        &self,
+        id: u64,
+        node: Option<ArtNode<T>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = node.map(|x| {
+            bincode::encode_to_vec(x, config::standard())
+                .expect("Expected encoding for disk write to succeed.")
+        });
+
+        self.write_cache
+            .lock()
+            .expect("Expected to acquire lock.")
+            .push_front((id, encoded));
+
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, id: &u64) -> NodeWrapper<T> {
+        self.lru
+            .lock()
+            .unwrap()
+            .get(id)
+            .unwrap_or_else(|| self.load(id.clone()))
     }
 
     fn load(&self, id: u64) -> NodeWrapper<T> {
-        let node = self
-            .disk
-            .read(id)
-            .and_then(|bytes_opt| {
-                let bytes = bytes_opt.expect("Expected item to exist on disk!");
+        // println!("ID: {:?}", id);
+        loop {
+            let wc_rg_res = self.write_cache.try_lock();
 
-                let (node, _): (ArtNode<T>, _) =
-                    bincode::decode_from_slice(&bytes, config::standard())
-                        .expect("Expected bincode deserialization to succeed!");
+            if wc_rg_res.is_err() {
+                continue;
+            }
 
-                Ok(node)
-            })
-            .expect("Expected reading from disk to succeed!");
+            let wc_rg = wc_rg_res.unwrap();
+            let ele = wc_rg.iter().find(|(wc_id, _)| *wc_id == id);
 
-        NodeWrapper::new(node)
+            let bytes_opt = match ele {
+                Some((_, node_opt)) => {
+                    if node_opt.is_some() {
+                        // println!("AM BYTES");
+                        Some(Vec::into_boxed_slice(node_opt.as_ref().unwrap().clone()))
+                    } else {
+                        println!("AM NOT");
+                        self.disk.read(id).expect("Expected to read node")
+                    }
+                }
+                None => self.disk.read(id).expect("Expected to read node"),
+            };
+
+            drop(wc_rg);
+
+            let err = format!("Expected {:?} to exist on disk or write cache.", id);
+
+            let bytes = bytes_opt.expect(&err);
+
+            let (node, _): (ArtNode<T>, _) = bincode::decode_from_slice(&bytes, config::standard())
+                .expect("Expected bincode deserialization to succeed!");
+
+            let wrapper = NodeWrapper::new(node);
+            self.lru.lock().unwrap().insert(id, wrapper.clone());
+            return wrapper.clone();
+        }
     }
 
     pub(crate) fn remove(&self, id: u64) -> Option<NodeWrapper<T>> {
-        self.lru.remove(&id)
+        self.lru.lock().unwrap().remove(&id)
     }
 
     pub(crate) fn insert(&self, id: u64, value: NodeWrapper<T>) {
-        self.lru.insert(id, value)
+        self.lru.lock().unwrap().insert(id, value)
     }
 }
 
-#[derive(Encode, Decode, Debug)]
+#[derive(Encode, Decode, Debug, Clone)]
 pub(crate) struct InternalData {
     pub(crate) children: Vec<NodePtr>,
     pub(crate) prefix: Vec<u8>,
@@ -183,19 +375,19 @@ pub(crate) struct InternalData {
     pub(crate) terminal: NodePtr,
 }
 
-#[derive(Encode, Decode, Debug)]
+#[derive(Encode, Decode, Debug, Clone)]
 pub(crate) struct LeafData<T> {
     pub(crate) value: T,
     pub(crate) key: Vec<u8>,
 }
 
-#[derive(Encode, Decode, Debug)]
+#[derive(Encode, Decode, Debug, Clone)]
 pub(crate) enum NodeData<T> {
     Leaf(LeafData<T>),
     Internal(InternalData),
 }
 
-#[derive(Encode, Decode, Debug)]
+#[derive(Encode, Decode, Debug, Clone)]
 pub struct ArtNode<T> {
     pub(crate) size: NodeSize,
     pub(crate) id: usize,
@@ -208,7 +400,7 @@ impl<T> ArtNode<T> {
         let mut node = Self {
             data: NodeData::Internal(InternalData {
                 prefix: prefix.into(),
-                idx: Some(vec![0; NodeSize::Four as usize]),
+                idx: Some(vec![EMPTY_SENTINEL_IDX; NodeSize::Four as usize]),
                 children: vec![NodePtr::sentinel_node(); NodeSize::Four as usize],
                 next_pos: 0,
                 count: 0,
@@ -619,26 +811,11 @@ impl<T> ArtNode<T> {
         let mut pos: usize = 0;
 
         while pos < data.count {
-            if idx_mut[pos] < key as u16 {
+            if idx_mut[pos] != EMPTY_SENTINEL_IDX {
                 pos += 1;
-                continue;
             } else {
                 break;
             }
-        }
-
-        unsafe {
-            std::ptr::copy(
-                idx_mut.as_ptr().add(pos),
-                idx_mut.as_mut_ptr().add(pos + 1),
-                data.count - pos,
-            );
-
-            std::ptr::copy(
-                data.children.as_ptr().add(pos),
-                data.children.as_mut_ptr().add(pos + 1),
-                data.count - pos,
-            );
         }
 
         idx_mut[pos] = key as u16;

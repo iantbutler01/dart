@@ -192,6 +192,18 @@ impl<T: ?Sized> OptimisticLockCouplingReadGuard<'_, T> {
             Err(VersionUpdated)
         }
     }
+
+    // pub fn upgrade_write_or_error(
+    //     self,
+    // ) -> OptimisticLockCouplingResult<OptimisticLockCouplingWriteGuard<T>> {
+    //     if self.version == self.lock.try_lock()? {
+    //         drop(self);
+    //         Ok(OptimisticLockCouplingWriteGuard::new(lock))
+    //     } else {
+    //         use crate::locking::OptimisticLockCouplingErrorType::*;
+    //         Err(VersionUpdated)
+    //     }
+    // }
 }
 impl<T: ?Sized> Deref for OptimisticLockCouplingReadGuard<'_, T> {
     type Target = T;
