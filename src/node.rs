@@ -10,6 +10,7 @@ use moka::sync::SegmentedCache;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::TryRecvError;
+use std::sync::MutexGuard;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::Duration;
@@ -242,7 +243,6 @@ where
                 match v.data.write() {
                     Ok(lock) => {
                         let node = lock.clone();
-                        // println!("WC ID: {:?} NODE: {:?}", k, node.id);
                         let option = Some(node);
 
                         let encoded = option.map(|x| {
@@ -282,10 +282,73 @@ where
         }
     }
 
+    pub fn lru_op_with_lock(
+        &self,
+        op: Box<
+            dyn FnOnce(
+                MutexGuard<SegmentedCache<u64, NodeWrapper<T>>>,
+            ) -> Result<(), Box<dyn std::error::Error>>,
+        >,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let lru = self.lru.lock().expect("Expected to acquire lru lock.");
+
+        let res = op(lru);
+
+        res
+    }
+
     pub(crate) fn write_wal(&self, op: Op<T>) -> Result<(), Box<dyn std::error::Error>> {
         let encoded = bincode::encode_to_vec(op, config::standard())?;
 
         self.log.send(encoded)?;
+
+        Ok(())
+    }
+
+    pub(crate) fn swap(
+        &self,
+        mut a: OptimisticLockCouplingWriteGuard<ArtNode<T>>,
+        a_wrap: NodeWrapper<T>,
+        mut b: OptimisticLockCouplingWriteGuard<ArtNode<T>>,
+        b_wrap: NodeWrapper<T>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        println!("HERE");
+        println!("{:?} | {:?}", a.id, b.id);
+
+        let a_id = a.id;
+        let b_id = b.id;
+
+        a.id = b_id;
+        b.id = a_id;
+
+        println!("{:?} | {:?}", a.id, b.id);
+
+        let lru = self.lru.lock().expect("Expected to acquire lru lock.");
+        let mut wc_lock = self
+            .write_cache
+            .lock()
+            .expect("Expected to acquire write cache lock.");
+
+        lru.insert(b_id as u64, a_wrap);
+
+        let a_opt = Some(a.clone());
+
+        let a_encoded = a_opt.map(|x| {
+            bincode::encode_to_vec(x, config::standard())
+                .expect("Expected encoding for disk write to succeed.")
+        });
+        wc_lock.push_front((b_id as u64, a_encoded));
+
+        lru.insert(a_id as u64, b_wrap);
+        let b_opt = Some(b.clone());
+        let b_encoded = b_opt.map(|x| {
+            bincode::encode_to_vec(x, config::standard())
+                .expect("Expected encoding for disk write to succeed.")
+        });
+        wc_lock.push_front((a_id as u64, b_encoded));
+
+        drop(lru);
+        drop(wc_lock);
 
         Ok(())
     }
@@ -308,12 +371,37 @@ where
         Ok(())
     }
 
+    pub(crate) fn write_multiple_to_disk(
+        &self,
+        nodes: Vec<(u64, Option<ArtNode<T>>)>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut wc_lock = self.write_cache.lock().expect("Expected to acquire lock.");
+
+        for (id, node) in nodes.iter().cloned() {
+            let encoded = node.map(|x| {
+                bincode::encode_to_vec(x, config::standard())
+                    .expect("Expected encoding for disk write to succeed.")
+            });
+            wc_lock.push_front((id, encoded));
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn get(&self, id: &u64) -> NodeWrapper<T> {
-        self.lru
-            .lock()
-            .unwrap()
-            .get(id)
-            .unwrap_or_else(|| self.load(id.clone()))
+        let lru = self.lru.lock().expect("Expected to acquire LRU lock.");
+        let wrapper_opt = lru.get(id);
+
+        if wrapper_opt.is_none() {
+            let wrapper = self.load(id.clone());
+
+            // if !lru.contains_key(id) {
+            //     lru.insert(*id, wrapper.clone());
+            // }
+            return wrapper;
+        } else {
+            return wrapper_opt.unwrap();
+        }
     }
 
     fn load(&self, id: u64) -> NodeWrapper<T> {
@@ -326,7 +414,7 @@ where
             }
 
             let wc_rg = wc_rg_res.unwrap();
-            let ele = wc_rg.iter().find(|(wc_id, _)| *wc_id == id);
+            let ele = wc_rg.iter().find(|(wc_id, _)| *wc_id == id).clone();
 
             let bytes_opt = match ele {
                 Some((_, node_opt)) => {
@@ -340,7 +428,6 @@ where
                 }
                 None => self.disk.read(id).expect("Expected to read node"),
             };
-
             drop(wc_rg);
 
             let err = format!("Expected {:?} to exist on disk or write cache.", id);
@@ -351,7 +438,7 @@ where
                 .expect("Expected bincode deserialization to succeed!");
 
             let wrapper = NodeWrapper::new(node);
-            self.lru.lock().unwrap().insert(id, wrapper.clone());
+
             return wrapper.clone();
         }
     }
