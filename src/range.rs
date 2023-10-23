@@ -53,7 +53,8 @@ impl<'a> Range<'a> {
             }
 
             let node_ptr = self.state.as_mut().unwrap().current_node.load();
-            let node_wrapper = tree.fetch_node_wrapper(node_ptr);
+            let node_wrapper = tree.cache.lock().unwrap().get(&node_ptr.id);
+
             let node = node_wrapper.data.read()?;
 
             if node.is_leaf() {

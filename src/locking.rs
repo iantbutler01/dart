@@ -249,6 +249,7 @@ impl<T: ?Sized> Deref for OptimisticLockCouplingWriteGuard<'_, T> {
         unsafe { &*self.lock.data.get() }
     }
 }
+
 impl<T: ?Sized> DerefMut for OptimisticLockCouplingWriteGuard<'_, T> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -291,5 +292,14 @@ impl<'a, T: ?Sized> OptimisticLockCouplingWriteGuard<'a, T> {
     #[inline(always)]
     pub(crate) fn new(lock: &'a OptimisticLockCoupling<T>) -> Self {
         Self { lock }
+    }
+
+    #[inline(always)]
+    pub(crate) fn make_outdate(&mut self) {
+        if std::thread::panicking() {
+            self.lock.poisoned.fetch_or(true, Release);
+        } else {
+            self.lock.version_lock_outdate.fetch_add(0b10, Release);
+        }
     }
 }

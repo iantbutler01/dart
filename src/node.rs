@@ -11,12 +11,13 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::TryRecvError;
 use std::sync::MutexGuard;
+use std::sync::TryLockError;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::Duration;
 
 pub(crate) const EMPTY_SENTINEL_IDX: u16 = 256;
-pub(crate) const EMPTY_POINTER_ID: usize = 0;
+pub(crate) const EMPTY_POINTER_ID: u64 = 0;
 
 #[derive(Encode, Decode, PartialEq, Debug, Copy, Clone)]
 pub(crate) enum NodeSize {
@@ -50,13 +51,14 @@ impl<T> Clone for NodeWrapper<T> {
 unsafe impl<T> Send for NodeWrapper<T> {}
 unsafe impl<T> Sync for NodeWrapper<T> {}
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Clone)]
 pub(crate) enum OpType {
-    Insert,
+    Upsert,
+    Get,
     Remove,
 }
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Clone)]
 pub(crate) struct Op<T> {
     pub(crate) optype: OpType,
     pub(crate) value: Option<T>,
@@ -64,7 +66,7 @@ pub(crate) struct Op<T> {
 }
 
 impl<T: Encode + Decode> Op<T> {
-    fn new(optype: OpType, key: Vec<u8>, value: Option<T>) -> Self {
+    pub(crate) fn new(optype: OpType, key: Vec<u8>, value: Option<T>) -> Self {
         Self { optype, key, value }
     }
 }
@@ -126,7 +128,7 @@ impl WriteAheadLog {
 }
 
 pub(crate) struct NodeCache<T: 'static> {
-    pub(crate) lru: Arc<Mutex<SegmentedCache<u64, NodeWrapper<T>>>>,
+    pub(crate) lru: Arc<SegmentedCache<u64, NodeWrapper<T>>>,
     log: mpsc::Sender<Vec<u8>>,
     write_cache: Arc<Mutex<VecDeque<(u64, Option<Vec<u8>>)>>>,
     disk: Marble,
@@ -200,23 +202,32 @@ where
             let exit_signal = signal_clone2;
             let mut count = 0;
             loop {
-                let mut wc_lock = wc_ref.lock().expect("Expected to acquire write lock");
-                let cache_empty = wc_lock.is_empty();
+                let wc_lock_res = wc_ref.try_lock();
 
-                if !cache_empty {
-                    disk.write_batch(
-                        wc_lock
-                            .iter()
-                            .cloned()
-                            .rev()
-                            .collect::<Vec<(u64, Option<Vec<u8>>)>>(),
-                    )
-                    .expect("Expect write to disk to succeed.");
-                    wc_lock.clear();
+                match wc_lock_res {
+                    Ok(mut wc_lock) => {
+                        let cache_empty = wc_lock.is_empty();
 
-                    count += 1;
+                        if !cache_empty {
+                            disk.write_batch(wc_lock.iter().cloned().rev().collect::<Vec<(
+                                u64,
+                                Option<Vec<u8>>,
+                            )>>(
+                            ))
+                            .expect("Expect write to disk to succeed.");
+                            wc_lock.clear();
+
+                            count += 1;
+                        }
+                        drop(wc_lock);
+                    }
+                    Err(TryLockError::WouldBlock) => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => {
+                        panic!("Stuff borked.");
+                    }
                 }
-                drop(wc_lock);
 
                 if count >= 10000 {
                     count = 0;
@@ -234,67 +245,54 @@ where
 
         let evl_write_cache_handle = write_cache.clone();
 
-        let eviction_listener = move |k: Arc<u64>, v: NodeWrapper<T>, cause| {
-            if cause == RemovalCause::Replaced {
-                return;
-            }
-            let backoff = Backoff::new();
-            loop {
-                match v.data.write() {
-                    Ok(lock) => {
-                        let node = lock.clone();
-                        let option = Some(node);
+        // let eviction_listener = move |k: Arc<u64>, v: NodeWrapper<T>, cause| {
+        //     if cause == RemovalCause::Replaced {
+        //         return;
+        //     }
+        //     loop {
+        //         match v.data.write() {
+        //             Ok(lock) => {
+        //                 println!("IN THE LISTENER");
+        //                 let node = lock.clone();
+        //                 let option = Some(node);
 
-                        let encoded = option.map(|x| {
-                            bincode::encode_to_vec(x.clone(), config::standard())
-                                .expect("Expected encoding for disk write to succeed.")
-                        });
-                        let mut cache_lock = evl_write_cache_handle.lock().unwrap();
-                        cache_lock.push_front((*k, encoded));
-                        break;
-                    }
-                    Err(insert_error) => match insert_error {
-                        OptimisticLockCouplingErrorType::Blocked => {
-                            break;
-                        }
-                        e => {
-                            println!("E: {:?}", e);
-                            backoff.spin();
-                            continue;
-                        }
-                    },
-                }
-            }
-        };
+        //                 let encoded = option.map(|x| {
+        //                     bincode::encode_to_vec(x.clone(), config::standard())
+        //                         .expect("Expected encoding for disk write to succeed.")
+        //                 });
+        //                 let cache_lock_res = evl_write_cache_handle.lock();
+
+        //                 cache_lock_res.unwrap().push_front((*k, encoded));
+        //                 break;
+        //             }
+        //             Err(insert_error) => match insert_error {
+        //                 OptimisticLockCouplingErrorType::Blocked => {
+        //                     break;
+        //                 }
+        //                 e => {
+        //                     println!("E: {:?}", e);
+        //                     thread::sleep(Duration::from_millis(100));
+        //                     continue;
+        //                 }
+        //             },
+        //         }
+        //     }
+        //     println!("EXITING THE LISTENER");
+        // };
 
         let lru = SegmentedCache::builder(num_lru_segments)
             .max_capacity(max_lru_cap)
-            .eviction_listener(eviction_listener)
+            // .eviction_listener(eviction_listener)
             .build();
 
         Self {
-            lru: Arc::new(Mutex::new(lru)),
+            lru: Arc::new(lru),
             write_cache,
             log: tx,
             disk,
             threads: [Some(wal_handle), Some(write_handle)],
             thread_exit_signal: exit_signal.clone(),
         }
-    }
-
-    pub fn lru_op_with_lock(
-        &self,
-        op: Box<
-            dyn FnOnce(
-                MutexGuard<SegmentedCache<u64, NodeWrapper<T>>>,
-            ) -> Result<(), Box<dyn std::error::Error>>,
-        >,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let lru = self.lru.lock().expect("Expected to acquire lru lock.");
-
-        let res = op(lru);
-
-        res
     }
 
     pub(crate) fn write_wal(&self, op: Op<T>) -> Result<(), Box<dyn std::error::Error>> {
@@ -312,24 +310,18 @@ where
         mut b: OptimisticLockCouplingWriteGuard<ArtNode<T>>,
         b_wrap: NodeWrapper<T>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        println!("HERE");
-        println!("{:?} | {:?}", a.id, b.id);
-
         let a_id = a.id;
         let b_id = b.id;
 
         a.id = b_id;
         b.id = a_id;
 
-        println!("{:?} | {:?}", a.id, b.id);
-
-        let lru = self.lru.lock().expect("Expected to acquire lru lock.");
         let mut wc_lock = self
             .write_cache
             .lock()
             .expect("Expected to acquire write cache lock.");
 
-        lru.insert(b_id as u64, a_wrap);
+        self.lru.insert(b_id as u64, a_wrap);
 
         let a_opt = Some(a.clone());
 
@@ -339,7 +331,7 @@ where
         });
         wc_lock.push_front((b_id as u64, a_encoded));
 
-        lru.insert(a_id as u64, b_wrap);
+        self.lru.insert(a_id as u64, b_wrap);
         let b_opt = Some(b.clone());
         let b_encoded = b_opt.map(|x| {
             bincode::encode_to_vec(x, config::standard())
@@ -347,7 +339,8 @@ where
         });
         wc_lock.push_front((a_id as u64, b_encoded));
 
-        drop(lru);
+        drop(a);
+        drop(b);
         drop(wc_lock);
 
         Ok(())
@@ -371,84 +364,61 @@ where
         Ok(())
     }
 
-    pub(crate) fn write_multiple_to_disk(
-        &self,
-        nodes: Vec<(u64, Option<ArtNode<T>>)>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut wc_lock = self.write_cache.lock().expect("Expected to acquire lock.");
-
-        for (id, node) in nodes.iter().cloned() {
-            let encoded = node.map(|x| {
-                bincode::encode_to_vec(x, config::standard())
-                    .expect("Expected encoding for disk write to succeed.")
-            });
-            wc_lock.push_front((id, encoded));
-        }
-
-        Ok(())
-    }
-
     pub(crate) fn get(&self, id: &u64) -> NodeWrapper<T> {
-        let lru = self.lru.lock().expect("Expected to acquire LRU lock.");
-        let wrapper_opt = lru.get(id);
+        let wc_lock = self.write_cache.lock().unwrap();
+        let wrapper_opt = self.lru.get(id);
 
         if wrapper_opt.is_none() {
-            let wrapper = self.load(id.clone());
+            let wrapper = self.load(id.clone(), wc_lock);
 
-            // if !lru.contains_key(id) {
-            //     lru.insert(*id, wrapper.clone());
-            // }
+            if !self.lru.contains_key(id) {
+                self.lru.insert(*id, wrapper.clone());
+            }
             return wrapper;
         } else {
+            drop(wc_lock);
             return wrapper_opt.unwrap();
         }
     }
 
-    fn load(&self, id: u64) -> NodeWrapper<T> {
+    fn load(
+        &self,
+        id: u64,
+        wc_mutex: MutexGuard<'_, VecDeque<(u64, Option<Vec<u8>>)>>,
+    ) -> NodeWrapper<T> {
         // println!("ID: {:?}", id);
-        loop {
-            let wc_rg_res = self.write_cache.try_lock();
+        let ele = wc_mutex.iter().find(|(wc_id, _)| *wc_id == id).clone();
 
-            if wc_rg_res.is_err() {
-                continue;
-            }
-
-            let wc_rg = wc_rg_res.unwrap();
-            let ele = wc_rg.iter().find(|(wc_id, _)| *wc_id == id).clone();
-
-            let bytes_opt = match ele {
-                Some((_, node_opt)) => {
-                    if node_opt.is_some() {
-                        // println!("AM BYTES");
-                        Some(Vec::into_boxed_slice(node_opt.as_ref().unwrap().clone()))
-                    } else {
-                        println!("AM NOT");
-                        self.disk.read(id).expect("Expected to read node")
-                    }
+        let bytes_opt = match ele {
+            Some((_, node_opt)) => {
+                if node_opt.is_some() {
+                    // println!("AM BYTES");
+                    Some(Vec::into_boxed_slice(node_opt.as_ref().unwrap().clone()))
+                } else {
+                    println!("AM NOT");
+                    self.disk.read(id).expect("Expected to read node")
                 }
-                None => self.disk.read(id).expect("Expected to read node"),
-            };
-            drop(wc_rg);
+            }
+            None => self.disk.read(id).expect("Expected to read node"),
+        };
+        drop(wc_mutex);
 
-            let err = format!("Expected {:?} to exist on disk or write cache.", id);
+        let err = format!("Expected {:?} to exist on disk or write cache.", id);
 
-            let bytes = bytes_opt.expect(&err);
+        let bytes = bytes_opt.expect(&err);
 
-            let (node, _): (ArtNode<T>, _) = bincode::decode_from_slice(&bytes, config::standard())
-                .expect("Expected bincode deserialization to succeed!");
+        let (node, _): (ArtNode<T>, _) = bincode::decode_from_slice(&bytes, config::standard())
+            .expect("Expected bincode deserialization to succeed!");
 
-            let wrapper = NodeWrapper::new(node);
-
-            return wrapper.clone();
-        }
+        NodeWrapper::new(node)
     }
 
     pub(crate) fn remove(&self, id: u64) -> Option<NodeWrapper<T>> {
-        self.lru.lock().unwrap().remove(&id)
+        self.lru.remove(&id)
     }
 
     pub(crate) fn insert(&self, id: u64, value: NodeWrapper<T>) {
-        self.lru.lock().unwrap().insert(id, value)
+        self.lru.insert(id, value)
     }
 }
 
@@ -477,13 +447,13 @@ pub(crate) enum NodeData<T> {
 #[derive(Encode, Decode, Debug, Clone)]
 pub struct ArtNode<T> {
     pub(crate) size: NodeSize,
-    pub(crate) id: usize,
-    pub(crate) generation: usize,
+    pub(crate) id: u64,
+    pub(crate) generation: u64,
     data: NodeData<T>,
 }
 
 impl<T> ArtNode<T> {
-    pub(crate) fn new(prefix: &[u8], size: NodeSize, id: usize, generation: usize) -> Self {
+    pub(crate) fn new(prefix: &[u8], size: NodeSize, id: u64, generation: u64) -> Self {
         let mut node = Self {
             data: NodeData::Internal(InternalData {
                 prefix: prefix.into(),
@@ -507,7 +477,7 @@ impl<T> ArtNode<T> {
         }
     }
 
-    pub(crate) fn new_leaf(key: Vec<u8>, value: T, id: usize, generation: usize) -> Self {
+    pub(crate) fn new_leaf(key: Vec<u8>, value: T, id: u64, generation: u64) -> Self {
         Self {
             id,
             generation,
@@ -919,8 +889,8 @@ impl<T> ArtNode<T> {
 
 #[derive(Encode, Decode, Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct NodePtr {
-    pub(crate) id: usize,
-    pub(crate) generation: usize,
+    pub(crate) id: u64,
+    pub(crate) generation: u64,
 }
 
 impl NodePtr {

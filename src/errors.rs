@@ -3,8 +3,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Errors {
-    #[error("The data for key `{0}` does not exist in the tree.")]
-    NonExistantError(String),
+    #[error("The key does not exist in the tree.")]
+    NonExistantError,
     #[error("There was an error attempting to remove the key: {0}")]
     RemoveError(String),
     #[error("Attempted an operation on an empty tree.")]
@@ -15,6 +15,8 @@ pub enum Errors {
     GetError(String),
     #[error("Locking error.")]
     LockingError(OptimisticLockCouplingErrorType),
+    #[error("{0}")]
+    UnrecoverableError(String),
 }
 
 impl From<OptimisticLockCouplingErrorType> for Errors {
