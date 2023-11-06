@@ -1,7 +1,13 @@
 [package]
 name = "dart"
 version = "0.1.0"
+license-file = "LICENSE"
+description = "Disk backed concurrent Adaptive Radix Tree implementation, with optional generations."
 edition = "2021"
+repository = "https://github.com/iantbutler01/dart"
+readme = "README.md"
+keywords = ["search", "index", "fulltext", "radix", "tree"]
+categories = ["algorithms", "caching", "database-implementations", "data-structures"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -9,7 +15,6 @@ edition = "2021"
 crossbeam = "0.8.2"
 rayon = "1.8.0"
 moka = { version="0.12.1", features=['sync'] }
-tinyvec = {git = "https://github.com/iantbutler01/tinyvec", branch="ian/bincode-support", features=["bincode"]}
 marble = "15.0.7"
 bincode = "2.0.0-rc.3"
 thiserror = "1.0.47"
