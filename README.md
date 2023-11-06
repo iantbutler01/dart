@@ -1,12 +1,12 @@
 ### DART (Disk [backed] Adaptive Radix Tree)
 
-A Rust implementation of the [https://db.in.tum.de/~leis/papers/ART.pdf](Adaptive Radix Tree) with [https://db.in.tum.de/~leis/papers/artsync.pdf](optimistic locking modification) for thread safe concurrency.
+A Rust implementation of the [Adaptive Radix Tree](https://db.in.tum.de/~leis/papers/ART.pdf) with [optimistic locking modification](https://db.in.tum.de/~leis/papers/artsync.pdf) for thread safe concurrency.
 
 What makes DART unique is it serves operations from a configurable LRU cache and if the entry has been evicted will fall back to disk. This modification allows you to serve operations with a near constant memory footprint with a trade off for performance. This was developed with full text search in mind and in such cases there will undoutebdly be a set of common or hot paths through the tree. Hot paths will be served from the LRU while everything else will be fetched from disk.
 
-This idea was inspired by a set of blog posts by [https://www.linkedin.com/in/julienlemoine/](Julien Lemoine) where he discussed the original indexing structure for Algolia, a well known search as a service company.
+This idea was inspired by a set of blog posts by [Julien Lemoine](https://www.linkedin.com/in/julienlemoine/) where he discussed the original indexing structure for Algolia, a well known search as a service company.
 
-Further I wrote this to act as a drop in replacement for my naive inverted index implementation in my own Full Text Search Extension for postgresql [https://github.com/iantbutler01/Quria](Quria) which is still early and experimental and I have not yet completed the swap.
+Further I wrote this to act as a drop in replacement for my naive inverted index implementation in my own Full Text Search Extension for postgresql [Quria](https://github.com/iantbutler01/Quria) which is still early and experimental and I have not yet completed the swap.
 
 ## Example
 
