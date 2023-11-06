@@ -1,6 +1,6 @@
 ### DART (Disk [backed] Adaptive Radix Tree)
 
-![DALL·E 2023-11-05 20 28 24 - Design a flat vector graphic logo featuring a stylized hard drive in shades of blue and gray with a simplified, geometric appearance  The hard drive s](https://github.com/iantbutler01/dart/assets/6426407/42349361-a865-4544-b36f-817fa04aedda)
+<img src="https://github.com/iantbutler01/dart/assets/6426407/42349361-a865-4544-b36f-817fa04aedda" width="500" height="500">
 
 A Rust implementation of the [Adaptive Radix Tree](https://db.in.tum.de/~leis/papers/ART.pdf) with [optimistic locking modification](https://db.in.tum.de/~leis/papers/artsync.pdf) for thread safe concurrency.
 
