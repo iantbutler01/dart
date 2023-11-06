@@ -1,5 +1,5 @@
 [package]
-name = "dart"
+name = "dartlib"
 version = "0.1.0"
 license-file = "LICENSE"
 description = "Disk backed concurrent Adaptive Radix Tree implementation, with optional generations."
