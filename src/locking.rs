@@ -38,6 +38,7 @@ impl<T> OptimisticLockCoupling<T> {
     /// read transaction
     /// logic should be an inlined closure
     #[inline(always)]
+    #[allow(dead_code)]
     pub(crate) fn read_txn<F, R>(&self, mut logic: F) -> OptimisticLockCouplingResult<R>
     where
         F: FnMut(&OptimisticLockCouplingReadGuard<T>) -> OptimisticLockCouplingResult<R>,
@@ -98,10 +99,6 @@ impl<T: ?Sized + Default> Default for OptimisticLockCoupling<T> {
 impl<T: ?Sized> OptimisticLockCoupling<T> {
     /// make self outdate
     /// usually used when the container grows and this pointer point to this structure is replaced
-    #[inline(always)]
-    pub fn make_outdate(&self) {
-        self.version_lock_outdate.fetch_or(0b10, Release);
-    }
     /// is writter thread dead?
     /// if fail then fail ~
     /// no need extra sync
@@ -292,14 +289,5 @@ impl<'a, T: ?Sized> OptimisticLockCouplingWriteGuard<'a, T> {
     #[inline(always)]
     pub(crate) fn new(lock: &'a OptimisticLockCoupling<T>) -> Self {
         Self { lock }
-    }
-
-    #[inline(always)]
-    pub(crate) fn make_outdate(&mut self) {
-        if std::thread::panicking() {
-            self.lock.poisoned.fetch_or(true, Release);
-        } else {
-            self.lock.version_lock_outdate.fetch_add(0b10, Release);
-        }
     }
 }

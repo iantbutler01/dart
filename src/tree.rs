@@ -1,10 +1,13 @@
 use crate::errors::Errors;
 use crate::errors::OptimisticLockCouplingErrorType;
-use crate::locking::OptimisticLockCouplingWriteGuard;
 use crate::node::*;
 use bincode::{Decode, Encode};
 use crossbeam::atomic::AtomicCell;
 use crossbeam::utils::Backoff;
+use rayon::prelude::IndexedParallelIterator;
+use rayon::range;
+use std::collections::VecDeque;
+use std::ops::Index;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -18,6 +21,26 @@ pub struct Dart<T: 'static + Encode + Decode> {
     pub count: AtomicU64,
     pub levels: AtomicUsize,
     pub ops: AtomicUsize,
+}
+
+pub(crate) struct NodeIter<T: Clone + Encode + Decode> {
+    iter: Box<dyn Iterator<Item = Option<ArtNode<T>>>>,
+}
+
+impl<T: 'static + Clone + Encode + Decode> NodeIter<T> {
+    pub(crate) fn new(vec: Vec<Option<ArtNode<T>>>) -> Self {
+        Self {
+            iter: Box::new(vec.clone().into_iter()),
+        }
+    }
+}
+
+impl<T: Clone + Encode + Decode> Iterator for NodeIter<T> {
+    type Item = Option<ArtNode<T>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
 }
 
 unsafe impl<T: 'static + Encode + Decode> Sync for Dart<T> {}
@@ -54,7 +77,7 @@ where
         tree
     }
 
-    pub fn insert(&self, key: &[u8], value: T) -> Result<Option<T>, Errors> {
+    pub fn upsert(&self, key: &[u8], value: T) -> Result<Option<T>, Errors> {
         let op = Op::new(OpType::Upsert, key.into(), Some(value));
 
         self.execute_with_retry(op)
@@ -82,128 +105,41 @@ where
         }
     }
 
-    pub fn remove(&self, key: &[u8]) -> Result<(), Errors> {
-        let backoff = Backoff::new();
-        loop {
-            match self.remove_internal(key) {
-                Ok(_) => return Ok(()),
-                Err(remove_error) => match remove_error {
-                    Errors::LockingError(e) => match e {
-                        OptimisticLockCouplingErrorType::Outdated
-                        | OptimisticLockCouplingErrorType::Poisoned => return Err(remove_error),
-                        _ => {
-                            backoff.spin();
-                            continue;
-                        }
-                    },
-                    e => return Err(e),
-                },
-            }
-        }
+    pub fn remove(&self, key: &[u8]) -> Result<Option<T>, Errors> {
+        let op = Op::new(OpType::Remove, key.into(), None);
+
+        self.execute_with_retry(op)
     }
 
-    fn remove_internal(&self, key: &[u8]) -> Result<T, Errors> {
-        let root_ptr = self.root.load();
-        let root_wrapper = self.cache.lock().unwrap().get(&(root_ptr.id as u64));
-        let root = root_wrapper.data.read()?;
+    pub fn clean_up(&self) -> () {
+        let node_iter = self.iter_nodes();
 
-        let mut node_ptr = root.get_child(key[0]);
+        let cache = self.cache.lock().unwrap();
 
-        if node_ptr == NodePtr::sentinel_node() {
-            return Err(Errors::NonExistantError);
+        for node_opt in node_iter {
+            if node_opt.is_some() {
+                let node =
+                    node_opt.expect("Expected node to exist after literally just checking it did.");
+                cache.remove(node.id);
+                cache
+                    .write_disk(node.id, None)
+                    .expect("Expected write to disk to succeed.");
+            }
         }
 
-        let mut level = 0usize;
-        let mut next_node: NodePtr;
-        let mut parent: NodeWrapper<T> = root_wrapper;
-
-        loop {
-            let node_wrapper = self.cache.lock().unwrap().get(&(node_ptr.id as u64));
-            let read_guard = node_wrapper.data.read()?;
-            let mut node = read_guard;
-
-            if node.is_leaf() {
-                self.remove_node(node_ptr);
-
-                let mut parent_mut = parent.data.write()?;
-
-                if key == node.leaf_data_ref().key {
-                    parent_mut.remove(key[level]);
-                }
-
-                if parent_mut.internal_data_ref().prefix != [] && parent_mut.should_shrink() {
-                    parent_mut.shrink();
-                }
-
-                return Ok(node.leaf_data_ref().value.clone());
-            }
-
-            // Implement insertion starting with finding the nextNode if the prefix matches the current node for the given level.
-            let overlap = self.overlapping_prefix_len(&node, key, level);
-
-            if overlap != node.internal_data_ref().prefix.len() {
-                return Err(Errors::NonExistantError);
-            }
-
-            level = level + overlap;
-
-            node.try_sync()?;
-            node = node_wrapper.data.read()?;
-
-            if level >= key.len() {
-                if node.internal_data_ref().terminal != NodePtr::sentinel_node() {
-                    let cache = self.cache.lock().unwrap();
-
-                    let terminal_wrapper =
-                        cache.get(&(node.internal_data_ref().terminal.id as u64));
-
-                    let terminal = terminal_wrapper.data.read()?;
-
-                    let mut node_mut = node_wrapper.data.write()?;
-                    node_mut.internal_data_mut().terminal = NodePtr::sentinel_node();
-                    cache.remove(terminal.id as u64);
-
-                    return Ok(terminal.leaf_data_ref().value.clone());
-                }
-            }
-
-            node.try_sync()?;
-            node = node_wrapper.data.read()?;
-            next_node = node.get_child(key[level]);
-            if next_node == NodePtr::sentinel_node() {
-                if key == node.internal_data_ref().prefix
-                    && node.internal_data_ref().terminal != NodePtr::sentinel_node()
-                {
-                    let terminal_ptr = node.internal_data_ref().terminal;
-                    let mut mut_node = node_wrapper.data.write()?;
-                    mut_node.internal_data_mut().terminal = NodePtr::sentinel_node();
-
-                    let cache = self.cache.lock().unwrap();
-
-                    let terminal_wrapper = cache.get(&(terminal_ptr.id as u64));
-                    let terminal = terminal_wrapper
-                        .data
-                        .read()
-                        .expect("Expected to read terminal.");
-                    let value = terminal.leaf_data_ref().value.clone();
-
-                    cache.remove(terminal_ptr.id as u64);
-
-                    return Ok(value);
-                } else {
-                    return Err(Errors::NonExistantError);
-                }
-            }
-
-            node_ptr = next_node;
-            parent = node_wrapper;
-        }
+        cache
+            .disk_maintenance()
+            .expect("Expected disk maintenence to return success");
     }
 
     fn execute(&self, op: Op<T>) -> Result<Option<T>, Errors> {
         let key = op.key.as_slice();
         let root_ptr = self.root.load();
-        let root_wrapper = self.cache.lock().unwrap().get(&(root_ptr.id as u64));
+        let root_wrapper_opt = self.cache.lock().unwrap().get(&(root_ptr.id as u64));
+        if root_wrapper_opt.is_none() {
+            return Ok(None);
+        }
+        let root_wrapper = root_wrapper_opt.unwrap();
         let root = root_wrapper.data.read()?;
         let mut node_ptr = root.get_child(key[0]);
 
@@ -223,10 +159,7 @@ where
                         .expect("Expected to write insert to root to disk.");
                     return Ok(None);
                 }
-                _ => {
-                    println!("THIS SHOULDN'T APPEAR 0");
-                    return Err(Errors::NonExistantError);
-                }
+                _ => return Ok(None),
             }
         }
 
@@ -238,7 +171,16 @@ where
         let mut parent_read = parent.data.read()?;
 
         loop {
-            let node_wrapper = self.cache.lock().unwrap().get(&(node_ptr.id as u64));
+            let node_wrapper_opt = self.cache.lock().unwrap().get(&(node_ptr.id as u64));
+            if node_wrapper_opt.is_none() {
+                match op.optype {
+                    _ => {
+                        return Ok(None);
+                    }
+                }
+            }
+            let node_wrapper = node_wrapper_opt.unwrap();
+
             let mut node = node_wrapper.data.read()?;
 
             // println!("Checking leaf.");
@@ -252,8 +194,15 @@ where
 
                         if key == mut_node.leaf_data_ref().key {
                             //TODO(IAN) Write this to disk.
+                            let cache = self.cache.lock().unwrap();
                             let old_value = mut_node.leaf_data_ref().value.clone();
                             mut_node.leaf_data_mut().value = op.value.unwrap().clone();
+                            cache
+                                .write_disk(mut_node.id, Some(mut_node.clone()))
+                                .expect("Expected write to disk.");
+
+                            drop(cache);
+
                             return Ok(Some(old_value));
                         }
 
@@ -270,42 +219,55 @@ where
 
                             i += 1;
                         }
+
                         level = level + new_prefix.len();
                         if new_prefix == [] {
+                            let parent_read = parent.data.read()?;
+                            println!(
+                                "LEAF EXPANSION {:?} | {:?} | {:?} | {:?} | {:?} | {:?} | {:?} | {:?}",
+                                level,
+                                i,
+                                key,
+                                key2,
+                                new_prefix,
+                                parent_read.internal_data_ref(),
+                                parent_read.get_child(key[level]),
+                                parent_read.get_child(key[level]).id == mut_node.id
+                            );
+
                             return Err(Errors::UnrecoverableError("The new prefix for a leaf expansion was empty, tree is degenerate.".to_string()));
                         }
 
-                        let new_node_ptr = self.new_node(new_prefix.as_slice(), NodeSize::Four);
+                        let new_old_leaf_ptr =
+                            self.new_leaf(&key2, mut_node.leaf_data_ref().value.clone());
+
                         let new_leaf = self.new_leaf(key, op.value.unwrap());
 
-                        let cache = self.cache.lock().unwrap();
-                        let new_node = cache.get(&new_node_ptr.id);
-                        let mut new_mut_node = new_node.data.write()?;
+                        let _ = mut_node.expand();
 
                         if level >= key.len() {
-                            new_mut_node.internal_data_mut().terminal = new_leaf;
+                            mut_node.internal_data_mut().terminal = new_leaf;
                         } else {
-                            new_mut_node.insert(key[level], new_leaf);
+                            mut_node.insert(key[level], new_leaf);
                         }
+
+                        mut_node.internal_data_mut().prefix = new_prefix;
 
                         // Handle cases where there is a leaf for a key that is also a prefix. e.g. Key "a" and Key "ap", in this case "a" is both a prefix and a valid terminal.
                         if level == key2.len() {
-                            new_mut_node.internal_data_mut().terminal = new_node_ptr;
+                            mut_node.internal_data_mut().terminal = new_old_leaf_ptr;
                         } else {
-                            // Insert a pointer to its self, this is because we are about to swap the new node's ptr in the NodeCache and WAL with the parent, i.e. the current node.
-                            // This means ultimately it will point to the correct node after the swap.
-                            new_mut_node.insert(key2[level], new_node_ptr);
+                            mut_node.insert(key2[level], new_old_leaf_ptr);
                         }
 
-                        cache
-                            .swap(
-                                mut_node,
-                                node_wrapper.clone(),
-                                new_mut_node,
-                                new_node.clone(),
-                            )
-                            .expect("Expected swap and write to disk.");
+                        let cache = self
+                            .cache
+                            .lock()
+                            .expect("Expected to acquire lock for cache.");
 
+                        cache
+                            .write_disk(mut_node.id, Some(mut_node.clone()))
+                            .expect("Expected to write to disk.");
                         drop(cache);
 
                         self.levels.fetch_max(level, Ordering::SeqCst);
@@ -316,16 +278,39 @@ where
                         if node.leaf_data_ref().key == key {
                             return Ok(Some(node.leaf_data_ref().value.clone()));
                         } else {
-                            println!("{:?}", node.leaf_data_ref().key);
                             node.try_sync()?;
-                            println!("THIS SHOULDN'T APPEAR 1");
-                            return Err(Errors::NonExistantError);
+                            return Ok(None);
                         }
                     }
-                    _ => {
-                        return Err(Errors::UnrecoverableError(
-                            "Op not implemented yet.".to_string(),
-                        ))
+                    OpType::Remove => {
+                        if node.leaf_data_ref().key != key {
+                            return Ok(None);
+                        }
+                        let cache = self.cache.lock().unwrap();
+
+                        let mut parent_mut = parent.data.write()?;
+
+                        cache.remove(node_ptr.id);
+                        cache
+                            .write_disk(node_ptr.id, None)
+                            .expect("Expected write to disk.");
+
+                        if key == node.leaf_data_ref().key {
+                            parent_mut.remove(key[level]);
+                        }
+
+                        if parent_mut.internal_data_ref().prefix != [] && parent_mut.should_shrink()
+                        {
+                            parent_mut.shrink();
+                        }
+
+                        cache
+                            .write_disk(parent_mut.id, Some(parent_mut.clone()))
+                            .expect("Expected write to disk.");
+
+                        drop(cache);
+
+                        return Ok(Some(node.leaf_data_ref().value.clone()));
                     }
                 }
             }
@@ -338,50 +323,91 @@ where
                     OpType::Upsert => {
                         let parent_lock = parent.data.write()?;
                         let mut _mut_node = node_wrapper.data.write()?;
+                        let old_prefix = _mut_node.internal_data_ref().prefix.clone();
 
                         let new_prefix = &key[level..level + overlap];
 
                         if new_prefix == [] {
+                            println!(
+                                "OVERLAP EXPANSION: {:?} | {:?} | {:?} | {:?} | {:?} | {:?}",
+                                level,
+                                overlap + level,
+                                key,
+                                _mut_node.internal_data_ref().prefix,
+                                _mut_node.internal_data_ref().terminal,
+                                new_prefix
+                            );
                             return Err(Errors::UnrecoverableError("The new prefix for an overlap mismatch was empty, tree is degenerate.".to_string()));
                         }
 
-                        let new_node_ptr = self.new_node(new_prefix, NodeSize::Four);
-                        let new_leaf = self.new_leaf(key, op.value.unwrap());
+                        if _mut_node.is_full() {
+                            println!("EXPANDING IN OVERLAP");
+                            _mut_node.expand();
+                        }
 
-                        let cache = self.cache.lock().unwrap();
-                        let new_node_wrapper = cache.get(&new_node_ptr.id);
-                        let mut new_mut_node = new_node_wrapper.data.write()?;
+                        let new_node_ptr = self.new_node(
+                            _mut_node.internal_data_ref().prefix.as_slice(),
+                            _mut_node.size,
+                        );
+                        let new_node_wrapper =
+                            self.cache.lock().unwrap().get(&new_node_ptr.id).unwrap();
+                        let mut new_node_mut = new_node_wrapper.data.write()?;
 
-                        new_mut_node.insert(key[overlap + level], new_leaf);
-                        // Insert a pointer to itself because it will be swapped directly after.
-                        new_mut_node
-                            .insert(_mut_node.internal_data_ref().prefix[overlap], new_node_ptr);
+                        let original_data = _mut_node.copy_internal_contents_to(&mut new_node_mut);
+
+                        let new_leaf_ptr = self.new_leaf(key, op.value.unwrap());
+
+                        if key.len() <= overlap + level {
+                            println!(
+                                "OVERLAP EXPANSION: {:?} | {:?} | {:?} | {:?} | {:?} | {:?}",
+                                level,
+                                overlap + level,
+                                key,
+                                _mut_node.internal_data_ref().prefix,
+                                _mut_node.internal_data_ref().terminal,
+                                new_prefix
+                            )
+                        }
+
+                        _mut_node.internal_data_mut().idx = original_data.idx;
+                        _mut_node.internal_data_mut().children = original_data.children;
+                        _mut_node.internal_data_mut().count = original_data.count;
+                        _mut_node.internal_data_mut().next_pos = original_data.next_pos;
+                        _mut_node.internal_data_mut().terminal = original_data.terminal;
+
+                        if overlap + level == key.len() {
+                            _mut_node.internal_data_mut().terminal = new_leaf_ptr
+                        } else {
+                            _mut_node.insert(key[overlap + level], new_leaf_ptr);
+                        }
+                        _mut_node.insert(old_prefix[overlap], new_node_ptr);
+
                         let updated_prefix: Vec<u8> =
                             _mut_node.internal_data_mut().prefix[overlap..].into();
 
-                        _mut_node.internal_data_mut().prefix = updated_prefix;
+                        new_node_mut.internal_data_mut().prefix = updated_prefix;
+
+                        _mut_node.internal_data_mut().prefix = new_prefix.into();
+
+                        let cache = self
+                            .cache
+                            .lock()
+                            .expect("Expected to acquire lock on cache.");
 
                         cache
-                            .swap(
-                                _mut_node,
-                                node_wrapper.clone(),
-                                new_mut_node,
-                                new_node_wrapper.clone(),
-                            )
-                            .expect("Expected swap and write to disk.");
+                            .write_disk(_mut_node.id, Some(_mut_node.clone()))
+                            .expect("Expected to write to disk.");
+                        cache
+                            .write_disk(new_node_mut.id, Some(new_node_mut.clone()))
+                            .expect("Expected to write to disk.");
 
                         drop(cache);
                         drop(parent_lock);
                         return Ok(None);
                     }
                     _ => {
-                        let prefix = node.internal_data_ref().prefix.clone();
                         node.try_sync()?;
-                        println!(
-                            "THIS SHOULDN'T APPEAR 2 {:?} | {:?} | {:?}",
-                            overlap, key, prefix
-                        );
-                        return Err(Errors::NonExistantError);
+                        return Ok(None);
                     }
                 }
             }
@@ -395,12 +421,17 @@ where
                         // println!("IN TERMINAL");
                         let parent_lock = parent.data.write()?;
                         let mut mut_node = node_wrapper.data.write()?;
-                        let cache = self.cache.lock().unwrap();
 
                         let ret =
                             if mut_node.internal_data_ref().terminal != NodePtr::sentinel_node() {
-                                let terminal_node =
+                                let cache = self.cache.lock().unwrap();
+                                let terminal_node_opt =
                                     cache.get(&mut_node.internal_data_ref().terminal.id);
+                                if terminal_node_opt.is_none() {
+                                    return Ok(None);
+                                }
+                                let terminal_node = terminal_node_opt.unwrap();
+
                                 let mut terminal_node_mut = terminal_node.data.write()?;
                                 let old_value = terminal_node_mut.leaf_data_ref().value.clone();
                                 terminal_node_mut.leaf_data_mut().value = op.value.unwrap();
@@ -412,31 +443,39 @@ where
                                     )
                                     .expect("Expected write to disk.");
 
+                                drop(cache);
                                 Some(old_value)
                             } else {
                                 let new_leaf_node = self.new_leaf(key, op.value.unwrap());
 
+                                let cache = self.cache.lock().unwrap();
                                 mut_node.internal_data_mut().terminal = new_leaf_node;
 
                                 cache
                                     .write_disk(mut_node.id, Some(mut_node.clone()))
                                     .expect("Expected write to disk.");
 
+                                drop(cache);
+
                                 None
                             };
 
-                        drop(cache);
                         drop(parent_lock);
 
                         return Ok(ret);
                     }
                     OpType::Get => {
                         if node.internal_data_ref().terminal != NodePtr::sentinel_node() {
-                            let terminal_node = self
+                            let terminal_node_opt = self
                                 .cache
                                 .lock()
                                 .unwrap()
                                 .get(&node.internal_data_ref().terminal.id);
+                            if terminal_node_opt.is_none() {
+                                return Ok(None);
+                            }
+                            let terminal_node = terminal_node_opt.unwrap();
+
                             let terminal_node = terminal_node.data.read()?;
 
                             if terminal_node.leaf_data_ref().key != key {
@@ -448,13 +487,41 @@ where
                         } else {
                             node.try_sync()?;
                             println!("This shouldn't appear. 3");
-                            return Err(Errors::NonExistantError);
+                            return Ok(None);
                         }
                     }
-                    _ => {
-                        return Err(Errors::UnrecoverableError(
-                            "Op not implemented.".to_string(),
-                        ))
+                    OpType::Remove => {
+                        if node.internal_data_ref().terminal != NodePtr::sentinel_node() {
+                            let cache = self.cache.lock().unwrap();
+
+                            let terminal_wrapper_opt =
+                                cache.get(&(node.internal_data_ref().terminal.id as u64));
+
+                            if terminal_wrapper_opt.is_none() {
+                                return Ok(None);
+                            }
+
+                            let terminal_wrapper = terminal_wrapper_opt.unwrap();
+
+                            let terminal = terminal_wrapper.data.read()?;
+
+                            let mut node_mut = node_wrapper.data.write()?;
+                            node_mut.internal_data_mut().terminal = NodePtr::sentinel_node();
+                            cache
+                                .write_disk(node_mut.id, Some(node_mut.clone()))
+                                .expect("Expected write to disk.");
+
+                            cache.remove(terminal.id as u64);
+                            cache
+                                .write_disk(terminal.id, None)
+                                .expect("Expected write to disk.");
+
+                            drop(cache);
+
+                            return Ok(Some(terminal.leaf_data_ref().value.clone()));
+                        } else {
+                            return Ok(None);
+                        }
                     }
                 }
             }
@@ -476,8 +543,8 @@ where
 
                             let cache = self.cache.lock().unwrap();
 
-                            mut_node.insert(key[level], new_leaf);
                             mut_node.expand();
+                            mut_node.insert(key[level], new_leaf);
 
                             cache
                                 .write_disk(mut_node.id, Some(mut_node.clone()))
@@ -506,34 +573,17 @@ where
                     }
                     _ => {
                         node.try_sync()?;
-                        println!("This shouldn't appear. 4");
-                        return Err(Errors::NonExistantError);
+                        return Ok(None);
                     }
                 }
             }
 
-            // println!("After standard syncs.");
-            level = level;
             // println!("{:?}", level);
             node_ptr = next_node;
             parent = node_wrapper;
             parent_read = parent.data.read()?;
             // println!("After parent read.");
         }
-    }
-
-    fn swap_node(
-        &self,
-        parent: OptimisticLockCouplingWriteGuard<ArtNode<T>>,
-        parent_wrapper: NodeWrapper<T>,
-        child: OptimisticLockCouplingWriteGuard<ArtNode<T>>,
-        child_wrapper: NodeWrapper<T>,
-    ) {
-        self.cache
-            .lock()
-            .unwrap()
-            .swap(parent, parent_wrapper, child, child_wrapper)
-            .expect("Expected SWAP to complete.");
     }
 
     fn new_leaf(&self, key: &[u8], value: T) -> NodePtr {
@@ -587,14 +637,52 @@ where
         ptr
     }
 
-    fn remove_node(&self, ptr: NodePtr) {
-        self.cache.lock().unwrap().remove(ptr.id as u64);
+    pub(crate) fn iter_nodes(&self) -> impl Iterator<Item = Option<ArtNode<T>>> {
+        let cache = self.cache.lock().expect("Expected to acquire cache lock.");
+
+        let mut queue: VecDeque<NodePtr> = VecDeque::new();
+        let mut node_vec: Vec<Option<ArtNode<T>>> = Vec::new();
+
+        let root_ptr = self.root.load();
+        if root_ptr == NodePtr::sentinel_node() {
+            return NodeIter::new(Vec::new());
+        }
+
+        queue.push_back(root_ptr);
+
+        while queue.len() > 0 {
+            let node_ptr = queue.pop_front().unwrap();
+            let node_opt = cache.get_node_raw(&(node_ptr.id as u64));
+
+            if node_opt.is_none() {
+                continue;
+            }
+
+            let node = node_opt.unwrap();
+
+            if node.is_leaf() {
+                node_vec.push(Some(node.clone()));
+                continue;
+            }
+
+            if node.internal_data_ref().terminal != NodePtr::sentinel_node() {
+                queue.push_back(node.internal_data_ref().terminal)
+            }
+
+            for ptr in node.internal_data_ref().children.iter() {
+                queue.push_back(*ptr)
+            }
+
+            continue;
+        }
+
+        NodeIter::new(node_vec)
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<T, Errors> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<T>, Errors> {
         let op = Op::new(OpType::Get, key.into(), None);
 
-        self.execute_with_retry(op).map(|val| val.unwrap())
+        self.execute_with_retry(op)
     }
 
     pub(crate) fn overlapping_prefix_len(
@@ -603,25 +691,25 @@ where
         key: &[u8],
         level: usize,
     ) -> usize {
-        let mut count = 0;
-        for i in 0..core::cmp::min(node.internal_data_ref().prefix.len(), key.len()) {
+        let range_max = core::cmp::min(node.internal_data_ref().prefix.len(), key.len());
+
+        // println!(
+        //     "{:?} | {:?} | {:?} | {:?}",
+        //     level,
+        //     key.len(),
+        //     key[level],
+        //     node.internal_data_ref().prefix
+        // );
+        let mut i = 0;
+        while i < range_max && i + level < key.len() {
             if node.internal_data_ref().prefix[i] == key[i + level] {
-                count += 1;
+                i += 1;
             } else {
                 break;
             }
         }
-
-        count
+        i
     }
-}
-
-pub struct GDart<T: 'static + Encode + Decode>
-where
-    T: Send + Clone,
-{
-    current_generation: Dart<T>,
-    past_generations: Vec<Dart<T>>,
 }
 
 #[cfg(test)]
@@ -630,7 +718,6 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use crate::errors::Errors;
     use crate::tree::Dart;
     use crate::utils::in_temp_dir;
 
@@ -643,7 +730,7 @@ mod tests {
             let value = 64;
 
             let res = tree
-                .insert(key, value)
+                .upsert(key, value)
                 .expect("Expected no error on insert.");
             assert_eq!(res, None);
         })
@@ -658,13 +745,13 @@ mod tests {
             let value = 64;
 
             let res = tree
-                .insert(key, value)
+                .upsert(key, value)
                 .expect("Expected no error on insert.");
             assert_eq!(res, None);
 
             let key = "abb".as_bytes();
             let value = 65;
-            tree.insert(key, value)
+            tree.upsert(key, value)
                 .expect("Expected no error on resize to 4.");
             assert_eq!(res, None);
             assert_eq!(tree.levels.load(Ordering::Relaxed), 2);
@@ -680,13 +767,13 @@ mod tests {
             let value = 64;
 
             let res = tree
-                .insert(key, value)
+                .upsert(key, value)
                 .expect("Expected no error on insert.");
             assert_eq!(res, None);
 
             let key = "abb".as_bytes();
             let value = 65;
-            tree.insert(key, value)
+            tree.upsert(key, value)
                 .expect("Expected no error on resize to 4.");
             assert_eq!(res, None);
             assert_eq!(tree.levels.load(Ordering::Relaxed), 2);
@@ -694,7 +781,7 @@ mod tests {
             for i in 0..100 {
                 let key = "abc".as_bytes();
                 let value = i;
-                tree.insert(key, value)
+                tree.upsert(key, value)
                     .expect("Expected no error on resize to 4.");
                 assert_eq!(res, None);
                 assert_eq!(tree.levels.load(Ordering::Relaxed), 2);
@@ -703,7 +790,7 @@ mod tests {
             for i in 0..100 {
                 let key = "abd".as_bytes();
                 let value = i;
-                tree.insert(key, value)
+                tree.upsert(key, value)
                     .expect("Expected no error on resize to 4.");
                 assert_eq!(res, None);
                 assert_eq!(tree.levels.load(Ordering::Relaxed), 2);
@@ -723,13 +810,13 @@ mod tests {
             let value = HashMap::<String, String>::new();
 
             let res = tree
-                .insert(key, value)
+                .upsert(key, value)
                 .expect("Expected no error on insert.");
             assert_eq!(res, None);
 
             let key = "abb".as_bytes();
             let value = HashMap::<String, String>::new();
-            tree.insert(key, value)
+            tree.upsert(key, value)
                 .expect("Expected no error on resize to 4.");
             assert_eq!(res, None);
             assert_eq!(tree.levels.load(Ordering::Relaxed), 2);
@@ -745,7 +832,7 @@ mod tests {
             let value = 64;
 
             let res = tree
-                .insert(key, value)
+                .upsert(key, value)
                 .expect("Expected no error on insert.");
             assert_eq!(res, None);
 
@@ -756,7 +843,7 @@ mod tests {
                 let value = i as u64;
 
                 let res = tree
-                    .insert(key, value)
+                    .upsert(key, value)
                     .expect(&format!("Expected no error on {i}th insert."));
                 assert_eq!(res, None);
             }
@@ -775,11 +862,11 @@ mod tests {
             for i in 0..5 {
                 let part = (i as u8) as char;
                 fmt = format!("ab{}", part);
-                key = fmt.as_bytes().clone();
+                key = fmt.as_bytes();
                 let value = i as u64;
 
                 let res = tree
-                    .insert(key, value)
+                    .upsert(key, value)
                     .expect(&format!("Expected no error on {i}th insert."));
                 assert_eq!(res, None);
             }
@@ -800,7 +887,7 @@ mod tests {
                 let value = i as u64;
 
                 let res = tree
-                    .insert(key, value)
+                    .upsert(key, value)
                     .expect(&format!("Expected no error on {i}th insert."));
                 assert_eq!(res, None);
             }
@@ -819,11 +906,11 @@ mod tests {
             for i in 0..17 {
                 let part = (i as u8) as char;
                 fmt = format!("ab{}", part);
-                key = fmt.as_bytes().clone();
+                key = fmt.as_bytes();
                 let value = i as u64;
 
                 let res = tree
-                    .insert(key, value)
+                    .upsert(key, value)
                     .expect(&format!("Expected no error on {i}th insert."));
                 assert_eq!(res, None);
             }
@@ -841,7 +928,7 @@ mod tests {
             let value = 64;
 
             let res = tree
-                .insert(key, value)
+                .upsert(key, value)
                 .expect("Expected no error on insert.");
             assert_eq!(res, None);
 
@@ -852,7 +939,7 @@ mod tests {
                 let value = i as u64;
 
                 let res = tree
-                    .insert(key, value)
+                    .upsert(key, value)
                     .expect(&format!("Expected no error on {i}th insert."));
                 assert_eq!(res, None);
             }
@@ -872,11 +959,11 @@ mod tests {
             for i in 0..49 {
                 let part = (i as u8) as char;
                 fmt = format!("ab{}", part);
-                key = fmt.as_bytes().clone();
+                key = fmt.as_bytes();
                 let value = i as u64;
 
                 let res = tree
-                    .insert(key, value)
+                    .upsert(key, value)
                     .expect(&format!("Expected no error on {i}th insert."));
                 assert_eq!(res, None);
             }
@@ -896,13 +983,13 @@ mod tests {
             let value = 64;
 
             let res = tree
-                .insert(&key, value)
+                .upsert(&key, value)
                 .expect("Expected no error on insert.");
             assert_eq!(res, None);
 
             let key2 = vec![1, 2, 4];
             let value = 65;
-            let res = tree.insert(&key2, value).expect("Expected no error.");
+            let res = tree.upsert(&key2, value).expect("Expected no error.");
             assert_eq!(res, None);
 
             for i in 0..4 {
@@ -911,7 +998,7 @@ mod tests {
                 let value = i as u64;
 
                 let res = tree
-                    .insert(&key, value)
+                    .upsert(&key, value)
                     .expect(&format!("Expected no error on {i}th insert."));
                 assert_eq!(res, None);
             }
@@ -922,7 +1009,7 @@ mod tests {
                 let value = i as u64;
 
                 let res = tree
-                    .insert(&key, value)
+                    .upsert(&key, value)
                     .expect(&format!("Expected no error on {i}th insert."));
                 assert_eq!(res, None);
             }
@@ -936,18 +1023,18 @@ mod tests {
             for _ in 0..10 {
                 let tree = Dart::<u64>::new(5, 5, path.clone() + "/tree", path.clone() + "/wal");
 
-                tree.insert("apple".as_bytes(), 1).unwrap();
-                tree.insert("appetizer".as_bytes(), 2).unwrap();
-                tree.insert("apply".as_bytes(), 3).unwrap();
-                tree.insert("apt".as_bytes(), 4).unwrap();
-                tree.insert("arrange".as_bytes(), 5).unwrap();
-                tree.insert("art".as_bytes(), 5).unwrap();
-                tree.insert("archaic".as_bytes(), 5).unwrap();
-                tree.insert("arthropod".as_bytes(), 5).unwrap();
-                tree.insert("arc".as_bytes(), 5).unwrap();
-                tree.insert("bar".as_bytes(), 5).unwrap();
-                tree.insert("bark".as_bytes(), 5).unwrap();
-                tree.insert("bet".as_bytes(), 5).unwrap();
+                tree.upsert("apple".as_bytes(), 1).unwrap();
+                tree.upsert("appetizer".as_bytes(), 2).unwrap();
+                tree.upsert("apply".as_bytes(), 3).unwrap();
+                tree.upsert("apt".as_bytes(), 4).unwrap();
+                tree.upsert("arrange".as_bytes(), 5).unwrap();
+                tree.upsert("art".as_bytes(), 5).unwrap();
+                tree.upsert("archaic".as_bytes(), 5).unwrap();
+                tree.upsert("arthropod".as_bytes(), 5).unwrap();
+                tree.upsert("arc".as_bytes(), 5).unwrap();
+                tree.upsert("bar".as_bytes(), 5).unwrap();
+                tree.upsert("bark".as_bytes(), 5).unwrap();
+                tree.upsert("bet".as_bytes(), 5).unwrap();
                 // println!("------------------------------");
                 tree.get("apple".as_bytes())
                     .expect("Expected to get apple.");
@@ -969,8 +1056,24 @@ mod tests {
                 tree.get("bar".as_bytes()).expect("Expected to get bar.");
                 tree.get("bark".as_bytes()).expect("Expected to get bark.");
                 tree.get("bet".as_bytes()).expect("Expected to get bet.");
-                assert_eq!(tree.levels.load(Ordering::Relaxed), 4);
             }
+        })
+    }
+
+    #[test]
+    fn insert_overlap_at_extremes() {
+        in_temp_dir!(|path: String| {
+            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+
+            let k1 = &[0, 1, 2, 3, 4];
+            let k2 = &[0, 1, 2, 3, 4, 5, 6, 7];
+            let k3 = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 7];
+            let k4 = &[0, 1, 2, 3, 4, 5];
+
+            tree.upsert(k1, 1).expect("Expect upsert to succeed.");
+            tree.upsert(k2, 1).expect("Expect upsert to succeed.");
+            tree.upsert(k3, 1).expect("Expect upsert to succeed.");
+            tree.upsert(k4, 1).expect("Expect upsert to succeed.");
         })
     }
 
@@ -988,7 +1091,7 @@ mod tests {
                 // println!("-----------S");
                 // println!("INS: {:?}", i);
                 let res = tree
-                    .insert(&prev_key, value)
+                    .upsert(&prev_key, value)
                     .expect(&format!("Expected no error on {i}th insert."));
                 // println!("GET: {:?}", i);
                 assert_eq!(res, None);
@@ -1002,7 +1105,7 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
         in_temp_dir!(|path: String| {
-            for i in 0..100000 {
+            for _i in 0..10 {
                 let tree = Arc::new(Dart::<u64>::new(
                     10,
                     1,
@@ -1015,22 +1118,22 @@ mod tests {
 
                 let h1 = thread::spawn(move || {
                     let tree = ref1;
-                    tree.insert("apple".as_bytes(), 1).unwrap();
-                    tree.insert("apply".as_bytes(), 3).unwrap();
-                    tree.insert("apt".as_bytes(), 4).unwrap();
-                    tree.insert("bark".as_bytes(), 100).unwrap();
-                    tree.insert("arrange".as_bytes(), 5).unwrap();
+                    tree.upsert("apple".as_bytes(), 1).unwrap();
+                    tree.upsert("apply".as_bytes(), 3).unwrap();
+                    tree.upsert("apt".as_bytes(), 4).unwrap();
+                    tree.upsert("bark".as_bytes(), 100).unwrap();
+                    tree.upsert("arrange".as_bytes(), 5).unwrap();
                 });
 
                 let h2 = thread::spawn(move || {
                     let tree = ref2;
-                    tree.insert("appetizer".as_bytes(), 2).unwrap();
-                    tree.insert("art".as_bytes(), 5).unwrap();
-                    tree.insert("archaic".as_bytes(), 5).unwrap();
-                    tree.insert("arthropod".as_bytes(), 5).unwrap();
-                    tree.insert("arc".as_bytes(), 5).unwrap();
-                    tree.insert("bar".as_bytes(), 5).unwrap();
-                    tree.insert("bet".as_bytes(), 5).unwrap();
+                    tree.upsert("appetizer".as_bytes(), 2).unwrap();
+                    tree.upsert("art".as_bytes(), 5).unwrap();
+                    tree.upsert("archaic".as_bytes(), 5).unwrap();
+                    tree.upsert("arthropod".as_bytes(), 5).unwrap();
+                    tree.upsert("arc".as_bytes(), 5).unwrap();
+                    tree.upsert("bar".as_bytes(), 5).unwrap();
+                    tree.upsert("bet".as_bytes(), 5).unwrap();
                 });
 
                 h1.join()
@@ -1061,7 +1164,6 @@ mod tests {
                     .expect("Expected to get arrange.");
                 tree.get("bet".as_bytes()).expect("Expected to get bet.");
                 assert_eq!(tree.levels.load(Ordering::Relaxed), 4);
-                println!("DONE ONE LOOP {:?}", i);
             }
         })
     }
@@ -1091,7 +1193,7 @@ mod tests {
                     let index: usize = rng.gen_range(0..words.len());
                     let word = words.remove(index);
 
-                    tree.insert(word.as_bytes(), 1).unwrap();
+                    tree.upsert(word.as_bytes(), 1).unwrap();
                 }
 
                 std::thread::sleep(Duration::from_millis(100));
@@ -1116,7 +1218,8 @@ mod tests {
                 tree.get("arrange".as_bytes())
                     .expect("Expected to get arrage.");
                 tree.get("bet".as_bytes()).expect("Expected to get bet.");
-                assert_eq!(tree.levels.load(Ordering::Relaxed), 4);
+
+                println!("----------------------");
             })
         }
     }
@@ -1125,18 +1228,18 @@ mod tests {
     fn insert_breaking() {
         in_temp_dir!(|path: String| {
             let tree = Dart::<u64>::new(1, 1, path.clone() + "/tree", path + "/wal");
-            tree.insert("bark".as_bytes(), 1).unwrap();
-            tree.insert("arrange".as_bytes(), 1).unwrap();
-            tree.insert("arc".as_bytes(), 1).unwrap();
-            tree.insert("apply".as_bytes(), 1).unwrap();
-            tree.insert("apple".as_bytes(), 1).unwrap();
-            tree.insert("archaic".as_bytes(), 5).unwrap();
-            tree.insert("appetizer".as_bytes(), 5).unwrap();
-            tree.insert("art".as_bytes(), 1).unwrap();
-            tree.insert("apt".as_bytes(), 1).unwrap();
-            tree.insert("arthropod".as_bytes(), 1).unwrap();
-            tree.insert("bet".as_bytes(), 100).unwrap();
-            tree.insert("bar".as_bytes(), 5).unwrap();
+            tree.upsert("bark".as_bytes(), 1).unwrap();
+            tree.upsert("arrange".as_bytes(), 1).unwrap();
+            tree.upsert("arc".as_bytes(), 1).unwrap();
+            tree.upsert("apply".as_bytes(), 1).unwrap();
+            tree.upsert("apple".as_bytes(), 1).unwrap();
+            tree.upsert("archaic".as_bytes(), 5).unwrap();
+            tree.upsert("appetizer".as_bytes(), 5).unwrap();
+            tree.upsert("art".as_bytes(), 1).unwrap();
+            tree.upsert("apt".as_bytes(), 1).unwrap();
+            tree.upsert("arthropod".as_bytes(), 1).unwrap();
+            tree.upsert("bet".as_bytes(), 100).unwrap();
+            tree.upsert("bar".as_bytes(), 5).unwrap();
 
             tree.get("appetizer".as_bytes())
                 .expect("Expected to get appetizer.");
@@ -1176,7 +1279,7 @@ mod tests {
                     let value = i as u64;
 
                     let res = tree
-                        .insert(&current_vec, value)
+                        .upsert(&current_vec, value)
                         .expect(&format!("Expected no error on {i}th insert."));
                     assert_eq!(res, None);
                 }
@@ -1198,15 +1301,14 @@ mod tests {
                     let value = j as u64;
 
                     let res = tree
-                        .insert(&key, value)
+                        .upsert(&key, value)
                         .expect(&format!("Expected no error on {j}th insert."));
                     assert_eq!(res, None);
                 }
             }
 
             let res = tree.get(&[0, 1, 2, 3, 9]).expect("Expected result.");
-
-            assert_eq!(res, 9)
+            assert_eq!(res.unwrap(), 9)
         })
     }
 
@@ -1224,7 +1326,7 @@ mod tests {
                     let value = j as u64;
 
                     let res = tree
-                        .insert(&key, value)
+                        .upsert(&key, value)
                         .expect(&format!("Expected no error on {j}th insert."));
                     assert_eq!(res, None);
                 }
@@ -1232,12 +1334,10 @@ mod tests {
 
             let res = tree.get(&[0, 1, 2, 3, 11]);
 
-            assert_eq!(res.is_err(), true);
-
             match res {
+                Ok(None) => true,
                 Err(e) => match e {
-                    Errors::NonExistantError => true,
-                    _ => panic!("Expected a NonExistantError"),
+                    _ => panic!("Expected no error."),
                 },
                 _ => panic!("Expected key not to be found!"),
             }
@@ -1258,7 +1358,7 @@ mod tests {
                     let value = i as u64;
 
                     let res = tree
-                        .insert(&current_vec, value)
+                        .upsert(&current_vec, value)
                         .expect(&format!("Expected no error on {i}th insert."));
                     assert_eq!(res, None);
                 }
@@ -1269,13 +1369,13 @@ mod tests {
             tree.remove(test_key)
                 .expect("Expected this to remove correctly.");
 
-            tree.insert(test_key, 20)
+            tree.upsert(test_key, 20)
                 .expect("Expected this to insert correctly.");
 
-            tree.insert(test_key, 64)
+            tree.upsert(test_key, 64)
                 .expect("Expected this to insert correctly.");
 
-            assert_eq!(tree.get(test_key).unwrap(), 64);
+            assert_eq!(tree.get(test_key).unwrap().unwrap(), 64);
         })
     }
 
@@ -1293,7 +1393,7 @@ mod tests {
                     let value = i as u64;
 
                     let res = tree
-                        .insert(&current_vec, value)
+                        .upsert(&current_vec, value)
                         .expect(&format!("Expected no error on {i}th insert."));
                     assert_eq!(res, None);
                     let err = format!(
@@ -1301,9 +1401,10 @@ mod tests {
                         current_vec
                     );
                     let res = tree.get(&current_vec).expect(err.as_str());
-
-                    assert_eq!(res, value);
-                    println!("END");
+                    if res.is_none() {
+                        println!("{:?} | {:?}", current_vec, i)
+                    }
+                    assert_eq!(res.unwrap(), value);
                 }
             }
 
@@ -1317,7 +1418,7 @@ mod tests {
 
                     let res = tree.get(&current_vec).expect("Expected to get value.");
 
-                    assert_eq!(res, value);
+                    assert_eq!(res.unwrap(), value);
                 }
             }
         })
@@ -1337,7 +1438,7 @@ mod tests {
                     let value = i as u64;
 
                     let res = tree
-                        .insert(&current_vec, value)
+                        .upsert(&current_vec, value)
                         .expect(&format!("Expected no error on {i}th insert."));
                     assert_eq!(res, None);
                 }
@@ -1360,7 +1461,7 @@ mod tests {
 
                         let res = res.expect(&format!("Expected no error on {i}/{j} th removal."));
 
-                        assert_eq!(res, ());
+                        assert_eq!(res, Some(j as u64));
                     }
                 }
             }

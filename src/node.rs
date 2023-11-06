@@ -1,19 +1,13 @@
-use crate::errors::Errors;
-use crate::errors::OptimisticLockCouplingErrorType;
 use crate::locking::*;
 use bincode::{config, Decode, Encode};
-use core::num;
-use crossbeam::utils::Backoff;
 use marble::Marble;
-use moka::notification::RemovalCause;
 use moka::sync::SegmentedCache;
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::TryRecvError;
 use std::sync::MutexGuard;
 use std::sync::TryLockError;
-use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::thread::{self, JoinHandle, Thread};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 pub(crate) const EMPTY_SENTINEL_IDX: u16 = 256;
@@ -243,43 +237,6 @@ where
             }
         });
 
-        let evl_write_cache_handle = write_cache.clone();
-
-        // let eviction_listener = move |k: Arc<u64>, v: NodeWrapper<T>, cause| {
-        //     if cause == RemovalCause::Replaced {
-        //         return;
-        //     }
-        //     loop {
-        //         match v.data.write() {
-        //             Ok(lock) => {
-        //                 println!("IN THE LISTENER");
-        //                 let node = lock.clone();
-        //                 let option = Some(node);
-
-        //                 let encoded = option.map(|x| {
-        //                     bincode::encode_to_vec(x.clone(), config::standard())
-        //                         .expect("Expected encoding for disk write to succeed.")
-        //                 });
-        //                 let cache_lock_res = evl_write_cache_handle.lock();
-
-        //                 cache_lock_res.unwrap().push_front((*k, encoded));
-        //                 break;
-        //             }
-        //             Err(insert_error) => match insert_error {
-        //                 OptimisticLockCouplingErrorType::Blocked => {
-        //                     break;
-        //                 }
-        //                 e => {
-        //                     println!("E: {:?}", e);
-        //                     thread::sleep(Duration::from_millis(100));
-        //                     continue;
-        //                 }
-        //             },
-        //         }
-        //     }
-        //     println!("EXITING THE LISTENER");
-        // };
-
         let lru = SegmentedCache::builder(num_lru_segments)
             .max_capacity(max_lru_cap)
             // .eviction_listener(eviction_listener)
@@ -364,28 +321,47 @@ where
         Ok(())
     }
 
-    pub(crate) fn get(&self, id: &u64) -> NodeWrapper<T> {
+    pub(crate) fn disk_maintenance(&self) -> Result<usize, std::io::Error> {
+        self.disk.maintenance()
+    }
+
+    pub(crate) fn get(&self, id: &u64) -> Option<NodeWrapper<T>> {
+        self.get_internal(id, true)
+    }
+
+    fn get_internal(&self, id: &u64, insert_lru: bool) -> Option<NodeWrapper<T>> {
         let wc_lock = self.write_cache.lock().unwrap();
         let wrapper_opt = self.lru.get(id);
 
         if wrapper_opt.is_none() {
             let wrapper = self.load(id.clone(), wc_lock);
 
-            if !self.lru.contains_key(id) {
-                self.lru.insert(*id, wrapper.clone());
+            if wrapper.is_some() {
+                let wrapper = wrapper.unwrap();
+                if !self.lru.contains_key(id) && insert_lru {
+                    self.lru.insert(*id, wrapper.clone());
+                }
+                return Some(wrapper);
+            } else {
+                return None;
             }
-            return wrapper;
         } else {
             drop(wc_lock);
-            return wrapper_opt.unwrap();
+            return wrapper_opt;
         }
+    }
+
+    pub(crate) fn get_node_raw(&self, id: &u64) -> Option<ArtNode<T>> {
+        let wrapper = self.get_internal(id, false);
+
+        wrapper.map(|w| w.data.write().unwrap().clone())
     }
 
     fn load(
         &self,
         id: u64,
         wc_mutex: MutexGuard<'_, VecDeque<(u64, Option<Vec<u8>>)>>,
-    ) -> NodeWrapper<T> {
+    ) -> Option<NodeWrapper<T>> {
         // println!("ID: {:?}", id);
         let ele = wc_mutex.iter().find(|(wc_id, _)| *wc_id == id).clone();
 
@@ -396,21 +372,19 @@ where
                     Some(Vec::into_boxed_slice(node_opt.as_ref().unwrap().clone()))
                 } else {
                     println!("AM NOT");
-                    self.disk.read(id).expect("Expected to read node")
+                    None
                 }
             }
             None => self.disk.read(id).expect("Expected to read node"),
         };
         drop(wc_mutex);
 
-        let err = format!("Expected {:?} to exist on disk or write cache.", id);
+        bytes_opt.map(|bytes| {
+            let (node, _): (ArtNode<T>, _) = bincode::decode_from_slice(&bytes, config::standard())
+                .expect("Expected bincode deserialization to succeed!");
 
-        let bytes = bytes_opt.expect(&err);
-
-        let (node, _): (ArtNode<T>, _) = bincode::decode_from_slice(&bytes, config::standard())
-            .expect("Expected bincode deserialization to succeed!");
-
-        NodeWrapper::new(node)
+            NodeWrapper::new(node)
+        })
     }
 
     pub(crate) fn remove(&self, id: u64) -> Option<NodeWrapper<T>> {
@@ -452,7 +426,7 @@ pub struct ArtNode<T> {
     data: NodeData<T>,
 }
 
-impl<T> ArtNode<T> {
+impl<T: Clone> ArtNode<T> {
     pub(crate) fn new(prefix: &[u8], size: NodeSize, id: u64, generation: u64) -> Self {
         let mut node = Self {
             data: NodeData::Internal(InternalData {
@@ -472,7 +446,7 @@ impl<T> ArtNode<T> {
             if node.size == size {
                 return node;
             } else {
-                node.expand()
+                node.expand();
             }
         }
     }
@@ -518,10 +492,16 @@ impl<T> ArtNode<T> {
         data
     }
 
-    pub(crate) fn expand(&mut self) {
+    pub(crate) fn expand(&mut self) -> Option<(Vec<u8>, T)> {
         match self.newsize(true) {
-            NodeSize::TwoFiftySix => self.expand_256(),
-            NodeSize::FourtyEight => self.expand_48(),
+            NodeSize::TwoFiftySix => {
+                self.expand_256();
+                None
+            }
+            NodeSize::FourtyEight => {
+                self.expand_48();
+                None
+            }
             NodeSize::Sixteen => {
                 let NodeData::Internal(ref mut data) = self.data else {
                     panic!("Leaf node!");
@@ -540,21 +520,73 @@ impl<T> ArtNode<T> {
                 self.size = NodeSize::Sixteen;
                 data.idx = Some(new_idx);
                 data.children = new_child;
+
+                None
             }
             NodeSize::Four => {
-                let NodeData::Internal(ref mut data) = self.data else {
-                    panic!("Leaf node!");
-                };
+                let data: NodeData<T> = NodeData::Internal(InternalData {
+                    prefix: vec![],
+                    idx: Some(vec![EMPTY_SENTINEL_IDX; NodeSize::Four as usize]),
+                    children: vec![NodePtr::sentinel_node(); NodeSize::Four as usize],
+                    next_pos: 0,
+                    count: 0,
+                    terminal: NodePtr::sentinel_node(),
+                });
 
-                let new_idx = vec![EMPTY_SENTINEL_IDX; 4];
-                let new_child = vec![NodePtr::sentinel_node(); 4];
+                let mut ret = None;
 
+                if self.is_leaf() {
+                    let leaf_key = self.leaf_data_ref().key.clone();
+                    let value = self.leaf_data_ref().value.clone();
+
+                    ret = Some((leaf_key, value))
+                }
+
+                self.data = data;
                 self.size = NodeSize::Four;
-                data.idx = Some(new_idx);
-                data.children = new_child;
+
+                ret
             }
-            _ => panic!("Attempted to expand Leaf"),
+            _ => panic!("New size should never be less than 4 on expand."),
         }
+    }
+
+    pub(crate) fn copy_internal_contents_to(
+        &mut self,
+        node: &mut OptimisticLockCouplingWriteGuard<ArtNode<T>>,
+    ) -> InternalData {
+        let original_data = node.internal_data_mut().clone();
+        let node_data_mut = self.internal_data_mut();
+
+        let data: NodeData<T> = NodeData::Internal(InternalData {
+            prefix: node_data_mut.prefix.clone(),
+            idx: node_data_mut.idx.clone(),
+            children: node_data_mut.children.clone(),
+            next_pos: node_data_mut.next_pos,
+            count: node_data_mut.count,
+            terminal: node_data_mut.terminal,
+        });
+
+        node.data = data;
+        node.size = self.size;
+        original_data
+    }
+
+    pub(crate) fn copy_leaf_contents_to(
+        &mut self,
+        node: &mut OptimisticLockCouplingWriteGuard<ArtNode<T>>,
+    ) -> LeafData<T> {
+        let original_data = node.leaf_data_mut().clone();
+        let leaf_data_mut = self.leaf_data_mut();
+
+        let data = NodeData::Leaf(LeafData {
+            value: leaf_data_mut.value.clone(),
+            key: leaf_data_mut.key.clone(),
+        });
+
+        node.data = data;
+        node.size = NodeSize::One;
+        original_data
     }
 
     pub(crate) fn shrink(&mut self) {

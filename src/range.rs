@@ -53,7 +53,11 @@ impl<'a> Range<'a> {
             }
 
             let node_ptr = self.state.as_mut().unwrap().current_node.load();
-            let node_wrapper = tree.cache.lock().unwrap().get(&node_ptr.id);
+            let node_wrapper_opt = tree.cache.lock().unwrap().get(&node_ptr.id);
+            if node_wrapper_opt.is_none() {
+                return Err(Errors::NonExistantError);
+            }
+            let node_wrapper = node_wrapper_opt.unwrap();
 
             let node = node_wrapper.data.read()?;
 

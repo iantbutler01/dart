@@ -1,3 +1,11 @@
+use core::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
+
+use crossbeam::atomic::AtomicConsume;
+use crossbeam::{atomic::AtomicCell, epoch::Owned};
+
+#[allow(unused_macros)]
 macro_rules! in_temp_dir {
     ($block:expr) => {{
         let tmpdir = tempfile::tempdir().unwrap();
@@ -13,4 +21,6 @@ macro_rules! in_temp_dir {
     }};
 }
 
+#[allow(dead_code)]
+#[allow(unused_imports)]
 pub(crate) use in_temp_dir;
