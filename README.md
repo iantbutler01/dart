@@ -1,6 +1,6 @@
-### DART (Disk [backed] Adaptive Radix Tree)
+<img src="https://github.com/iantbutler01/dart/assets/6426407/42349361-a865-4544-b36f-817fa04aedda" width="400" height="400">
 
-<img src="https://github.com/iantbutler01/dart/assets/6426407/42349361-a865-4544-b36f-817fa04aedda" width="500" height="500">
+### DART (Disk [backed] Adaptive Radix Tree)
 
 A Rust implementation of the [Adaptive Radix Tree](https://db.in.tum.de/~leis/papers/ART.pdf) with [optimistic locking modification](https://db.in.tum.de/~leis/papers/artsync.pdf) for thread safe concurrency.
 
