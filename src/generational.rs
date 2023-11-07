@@ -1,3 +1,4 @@
+use crate::node::NodeCacheConfig;
 use crate::{errors::Errors, tree::Dart};
 use bincode::{Decode, Encode};
 use rayon::prelude::*;
@@ -19,7 +20,6 @@ where
     max_single_generation_lru_size: u64,
     num_single_generation_lru_segments: usize,
     write_path: String,
-    wal_path: String,
     merge_thread: Option<JoinHandle<()>>,
 }
 
@@ -30,22 +30,22 @@ impl<T: 'static + Encode + Decode + Send + Sync + Clone + Debug> GDart<T> {
         num_single_generation_lru_segments: usize,
         write_path: Option<String>,
     ) -> Self {
+        let mut dart_cache_config = NodeCacheConfig::default();
+        dart_cache_config.max_lru_cap = max_single_generation_lru_size;
+        dart_cache_config.num_lru_segments = num_single_generation_lru_segments;
+
         let write_path = write_path.unwrap_or(".gdart".to_string());
         let first_generation_write_path = write_path.clone() + "/0";
+        dart_cache_config.disk_path = first_generation_write_path;
+
         Self {
             max_single_generation_size,
             write_path: write_path.clone(),
-            wal_path: write_path.clone(),
             past_generations: Arc::new(RwLock::new(VecDeque::<_>::with_capacity(100))),
             max_single_generation_lru_size,
             num_single_generation_lru_segments,
             current_generation_number: AtomicU64::new(0),
-            current_generation: Arc::new(Dart::<T>::new(
-                max_single_generation_lru_size,
-                num_single_generation_lru_segments,
-                first_generation_write_path.clone() + "/disk",
-                first_generation_write_path.clone() + "/wal",
-            )),
+            current_generation: Arc::new(Dart::<T>::new(dart_cache_config)),
             merge_thread: None,
         }
     }
@@ -137,12 +137,16 @@ impl<T: 'static + Encode + Decode + Send + Sync + Clone + Debug> GDart<T> {
             .fetch_add(1 as u64, Ordering::SeqCst)
             + 1;
 
-        let new_gen = Dart::<T>::new(
+        let new_gen_write_path =
+            self.write_path.clone() + "/" + next_gen_number.clone().to_string().as_str() + "/disk";
+
+        let dart_cache_config = NodeCacheConfig::new(
             self.max_single_generation_lru_size,
             self.num_single_generation_lru_segments,
-            self.write_path.clone() + "/" + next_gen_number.clone().to_string().as_str() + "/disk",
-            self.wal_path.clone() + "/" + next_gen_number.to_string().as_str() + "/wal",
+            new_gen_write_path,
         );
+
+        let new_gen = Dart::<T>::new(dart_cache_config);
 
         Arc::new(new_gen)
     }

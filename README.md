@@ -13,10 +13,11 @@ Further I wrote this to act as a drop in replacement for my naive inverted index
 ## Example
 
 ```rust
-use dart::tree::Dart;
+use dart::tree::{Dart, NodeCacheConfig};
 
-//LRU Size, LRU Segments, Path for disk Writes, Path for WAL writes
-let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+//LRU Size, LRU Segments, Path for Disk Writes
+let cache_config = NodeCacheConfig::new(100, 1, path.clone() + "/tree")
+let tree = Dart::<u64>::new(cache_config);
 
 tree.upsert(&[1, 2, 3, 4], 64)
 let res = tree.get(&[1, 2, 3, 4]);

@@ -6,9 +6,10 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::MutexGuard;
 use std::sync::TryLockError;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use uuid::Uuid;
 
 pub(crate) const EMPTY_SENTINEL_IDX: u16 = 256;
 pub(crate) const EMPTY_POINTER_ID: u64 = 0;
@@ -65,69 +66,40 @@ impl<T: Encode + Decode> Op<T> {
     }
 }
 
-pub(crate) struct WriteAheadLog {
-    count: usize,
-    ops: Vec<(u64, Vec<u8>)>,
-    flushat: usize,
-    receiver: mpsc::Receiver<Vec<u8>>,
-    disk: Marble,
+pub struct NodeCacheConfig {
+    pub max_lru_cap: u64,
+    pub num_lru_segments: usize,
+    pub disk_path: String,
 }
 
-impl WriteAheadLog {
-    fn new(flushat: usize, path: String, receiver: mpsc::Receiver<Vec<u8>>) -> Self {
+impl NodeCacheConfig {
+    pub fn new(max_lru_cap: u64, num_lru_segments: usize, disk_path: String) -> Self {
         Self {
-            count: 0,
-            ops: Vec::new(),
-            flushat,
-            receiver,
-            disk: marble::open(path).expect("Expected WAL disk path to open without issue."),
+            max_lru_cap,
+            num_lru_segments,
+            disk_path,
         }
     }
+}
 
-    fn append(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        match self.receiver.try_recv() {
-            Ok(op) => {
-                self.ops.push((self.count as u64, op));
-
-                self.count += 1;
-            }
-            Err(recv_error) => match recv_error {
-                mpsc::TryRecvError::Empty => (),
-                mpsc::TryRecvError::Disconnected => return Err(Box::new(recv_error)),
-            },
+impl Default for NodeCacheConfig {
+    fn default() -> Self {
+        let uuid = Uuid::new_v4();
+        Self {
+            max_lru_cap: 1000,
+            num_lru_segments: 5,
+            disk_path: "~/.dart/".to_owned() + &uuid.to_string(),
         }
-
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.ops.len() >= self.flushat {
-            let batch = self.ops.iter().map(|(id, op)| (*id as u64, Some(op)));
-            self.disk.write_batch(batch)?;
-            if self.count % 100 == 0 {
-                self.disk.maintenance()?;
-            }
-
-            if self.count % 1000 == 0 {
-                let range_iter = ((self.count - 1000)..self.count).into_iter();
-
-                let batch: Vec<(u64, Option<Vec<u8>>)> =
-                    range_iter.map(|i| (i as u64, None)).collect();
-
-                self.disk.write_batch(batch)?;
-            }
-        }
-        Ok(())
     }
 }
 
 pub(crate) struct NodeCache<T: 'static> {
     pub(crate) lru: Arc<SegmentedCache<u64, NodeWrapper<T>>>,
-    log: mpsc::Sender<Vec<u8>>,
+    pub(crate) config: NodeCacheConfig,
     write_cache: Arc<Mutex<VecDeque<(u64, Option<Vec<u8>>)>>>,
     disk: Marble,
     thread_exit_signal: Arc<AtomicBool>,
-    threads: [Option<JoinHandle<()>>; 2],
+    threads: [Option<JoinHandle<()>>; 1],
 }
 
 impl<T: 'static> Drop for NodeCache<T> {
@@ -145,50 +117,26 @@ impl<T: 'static> Drop for NodeCache<T> {
     }
 }
 
+impl<T: 'static + Encode + Decode + Clone> Default for NodeCache<T> {
+    fn default() -> Self {
+        NodeCache::<T>::new(NodeCacheConfig::default())
+    }
+}
+
 impl<T: 'static + Encode + Decode> NodeCache<T>
 where
     T: Clone,
 {
-    pub(crate) fn new(
-        max_lru_cap: u64,
-        num_lru_segments: usize,
-        disk_path: String,
-        wal_path: String,
-    ) -> Self {
+    pub(crate) fn new(config: NodeCacheConfig) -> Self {
         let exit_signal = Arc::new(AtomicBool::new(false));
-        let signal_clone = exit_signal.clone();
         let signal_clone2 = exit_signal.clone();
 
-        let (tx, rx) = mpsc::channel();
-        let wal_handle = thread::spawn(move || {
-            let exit_signal = signal_clone;
-            let mut wal = WriteAheadLog::new(100, wal_path, rx);
-            loop {
-                match wal.append() {
-                    Ok(_) => (),
-                    Err(e) => {
-                        let recv_error = e.downcast_ref::<mpsc::TryRecvError>();
-
-                        if recv_error.is_some() {
-                            break;
-                        }
-
-                        panic!("Expected wal append to succeed!")
-                    }
-                }
-                wal.flush().expect("Expected flushing WAL to complete.");
-
-                if exit_signal.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
-                }
-            }
-        });
         let write_cache = Arc::new(Mutex::new(
             VecDeque::<(u64, Option<Vec<u8>>)>::with_capacity(1000),
         ));
         let wc_ref = write_cache.clone();
 
-        let disk = marble::open(disk_path).unwrap();
+        let disk = marble::open(config.disk_path.clone()).unwrap();
         let disk_ref = disk.clone();
 
         let write_handle = thread::spawn(move || {
@@ -237,70 +185,19 @@ where
             }
         });
 
-        let lru = SegmentedCache::builder(num_lru_segments)
-            .max_capacity(max_lru_cap)
+        let lru = SegmentedCache::builder(config.num_lru_segments)
+            .max_capacity(config.max_lru_cap)
             // .eviction_listener(eviction_listener)
             .build();
 
         Self {
             lru: Arc::new(lru),
             write_cache,
-            log: tx,
             disk,
-            threads: [Some(wal_handle), Some(write_handle)],
+            config,
+            threads: [Some(write_handle)],
             thread_exit_signal: exit_signal.clone(),
         }
-    }
-
-    pub(crate) fn write_wal(&self, op: Op<T>) -> Result<(), Box<dyn std::error::Error>> {
-        let encoded = bincode::encode_to_vec(op, config::standard())?;
-
-        self.log.send(encoded)?;
-
-        Ok(())
-    }
-
-    pub(crate) fn swap(
-        &self,
-        mut a: OptimisticLockCouplingWriteGuard<ArtNode<T>>,
-        a_wrap: NodeWrapper<T>,
-        mut b: OptimisticLockCouplingWriteGuard<ArtNode<T>>,
-        b_wrap: NodeWrapper<T>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let a_id = a.id;
-        let b_id = b.id;
-
-        a.id = b_id;
-        b.id = a_id;
-
-        let mut wc_lock = self
-            .write_cache
-            .lock()
-            .expect("Expected to acquire write cache lock.");
-
-        self.lru.insert(b_id as u64, a_wrap);
-
-        let a_opt = Some(a.clone());
-
-        let a_encoded = a_opt.map(|x| {
-            bincode::encode_to_vec(x, config::standard())
-                .expect("Expected encoding for disk write to succeed.")
-        });
-        wc_lock.push_front((b_id as u64, a_encoded));
-
-        self.lru.insert(a_id as u64, b_wrap);
-        let b_opt = Some(b.clone());
-        let b_encoded = b_opt.map(|x| {
-            bincode::encode_to_vec(x, config::standard())
-                .expect("Expected encoding for disk write to succeed.")
-        });
-        wc_lock.push_front((a_id as u64, b_encoded));
-
-        drop(a);
-        drop(b);
-        drop(wc_lock);
-
-        Ok(())
     }
 
     pub(crate) fn write_disk(
@@ -569,23 +466,6 @@ impl<T: Clone> ArtNode<T> {
 
         node.data = data;
         node.size = self.size;
-        original_data
-    }
-
-    pub(crate) fn copy_leaf_contents_to(
-        &mut self,
-        node: &mut OptimisticLockCouplingWriteGuard<ArtNode<T>>,
-    ) -> LeafData<T> {
-        let original_data = node.leaf_data_mut().clone();
-        let leaf_data_mut = self.leaf_data_mut();
-
-        let data = NodeData::Leaf(LeafData {
-            value: leaf_data_mut.value.clone(),
-            key: leaf_data_mut.key.clone(),
-        });
-
-        node.data = data;
-        node.size = NodeSize::One;
         original_data
     }
 

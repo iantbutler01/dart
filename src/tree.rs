@@ -1,13 +1,13 @@
 use crate::errors::Errors;
 use crate::errors::OptimisticLockCouplingErrorType;
+pub use crate::node::NodeCacheConfig;
 use crate::node::*;
 use bincode::{Decode, Encode};
 use crossbeam::atomic::AtomicCell;
 use crossbeam::utils::Backoff;
-use rayon::prelude::IndexedParallelIterator;
-use rayon::range;
+use rand::seq::SliceRandom;
+use rand::Rng;
 use std::collections::VecDeque;
-use std::ops::Index;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -46,24 +46,22 @@ impl<T: Clone + Encode + Decode> Iterator for NodeIter<T> {
 unsafe impl<T: 'static + Encode + Decode> Sync for Dart<T> {}
 unsafe impl<T: 'static + Encode + Decode> Send for Dart<T> {}
 
+impl<T: Encode + Decode + Clone> Default for Dart<T> {
+    fn default() -> Self {
+        let config = NodeCacheConfig::default();
+
+        Dart::<T>::new(config)
+    }
+}
+
 impl<T: Encode + Decode> Dart<T>
 where
     T: Clone,
 {
-    pub fn new(
-        max_lru_cap: u64,
-        num_lru_segments: usize,
-        disk_path: String,
-        wal_path: String,
-    ) -> Self {
+    pub fn new(cache_config: NodeCacheConfig) -> Self {
         let tree = Self {
             root: AtomicCell::new(NodePtr::sentinel_node()),
-            cache: Arc::new(Mutex::new(NodeCache::<T>::new(
-                max_lru_cap,
-                num_lru_segments,
-                disk_path,
-                wal_path,
-            ))),
+            cache: Arc::new(Mutex::new(NodeCache::<T>::new(cache_config))),
             generation: AtomicU64::new(0),
             count: AtomicU64::new(1),
             levels: AtomicUsize::new(0),
@@ -591,7 +589,7 @@ where
             key.into(),
             value.clone(),
             self.count.fetch_add(1, Ordering::SeqCst),
-            self.count.load(Ordering::SeqCst),
+            self.generation.load(Ordering::SeqCst),
         );
 
         let ptr = NodePtr {
@@ -616,7 +614,7 @@ where
             prefix,
             size,
             self.count.fetch_add(1, Ordering::SeqCst),
-            self.count.load(Ordering::SeqCst),
+            self.generation.load(Ordering::SeqCst),
         );
 
         let ptr = NodePtr {
@@ -679,6 +677,65 @@ where
         NodeIter::new(node_vec)
     }
 
+    pub fn load_root(&self, count: u64, generation: u64, warm: bool) -> Result<(), Errors> {
+        let cache = self.cache.lock().expect("Expected to acquire cache lock.");
+
+        let root = cache.get(&1);
+
+        if root.is_none() {
+            return Err(Errors::EmptyTreeError);
+        }
+
+        self.count.store(count, Ordering::SeqCst);
+        self.root.store(NodePtr { id: 1, generation });
+
+        // For now implementing a random walk until I can get something in here for data access patterns.
+        if warm {
+            let mut queue: VecDeque<NodePtr> = VecDeque::new();
+
+            let root_ptr = self.root.load();
+
+            queue.push_back(root_ptr);
+            let mut count = 0;
+
+            while queue.len() > 0 && count <= cache.config.max_lru_cap {
+                let node_ptr = queue.pop_front().unwrap();
+                let node_opt = cache.get(&(node_ptr.id as u64));
+
+                if node_opt.is_none() {
+                    continue;
+                }
+
+                let node_wrapper = node_opt.unwrap();
+                let node = node_wrapper.data.read()?;
+
+                if node.is_leaf() {
+                    continue;
+                }
+
+                if node.internal_data_ref().terminal != NodePtr::sentinel_node() {
+                    queue.push_back(node.internal_data_ref().terminal)
+                }
+
+                let mut rng = rand::thread_rng();
+                let random_amount = rng.gen_range(1..=node.internal_data_ref().children.len());
+
+                let sample = node
+                    .internal_data_ref()
+                    .children
+                    .choose_multiple(&mut rng, random_amount);
+
+                for ptr in sample {
+                    queue.push_back(*ptr)
+                }
+
+                count += 1;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn get(&self, key: &[u8]) -> Result<Option<T>, Errors> {
         let op = Op::new(OpType::Get, key.into(), None);
 
@@ -693,13 +750,6 @@ where
     ) -> usize {
         let range_max = core::cmp::min(node.internal_data_ref().prefix.len(), key.len());
 
-        // println!(
-        //     "{:?} | {:?} | {:?} | {:?}",
-        //     level,
-        //     key.len(),
-        //     key[level],
-        //     node.internal_data_ref().prefix
-        // );
         let mut i = 0;
         while i < range_max && i + level < key.len() {
             if node.internal_data_ref().prefix[i] == key[i + level] {
@@ -718,13 +768,15 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use crate::node::NodeCacheConfig;
     use crate::tree::Dart;
     use crate::utils::in_temp_dir;
 
     #[test]
     fn insert_at_root() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path.clone() + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             let key = "abc".as_bytes();
             let value = 64;
@@ -739,7 +791,8 @@ mod tests {
     #[test]
     fn insert_at_child() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             let key = "aba".as_bytes();
             let value = 64;
@@ -761,7 +814,8 @@ mod tests {
     #[test]
     fn insert_same_key_many_times() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             let key = "aba".as_bytes();
             let value = 64;
@@ -803,8 +857,8 @@ mod tests {
         use std::collections::HashMap;
 
         in_temp_dir!(|path: String| {
-            let tree =
-                Dart::<HashMap<String, String>>::new(100, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<HashMap<String, String>>::new(config);
 
             let key = "aba".as_bytes();
             let value = HashMap::<String, String>::new();
@@ -826,7 +880,8 @@ mod tests {
     #[test]
     fn insert_at_5th() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             let key = "aba".as_bytes();
             let value = 64;
@@ -854,7 +909,8 @@ mod tests {
     #[test]
     fn remove_at_5th() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             let mut key: &[u8] = &[];
             let mut fmt: String;
@@ -878,7 +934,8 @@ mod tests {
     #[test]
     fn insert_at_17th() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             for i in 0..=17 {
                 let part = (i as u8) as char;
@@ -898,7 +955,8 @@ mod tests {
     #[test]
     fn remove_at_17th() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(10, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             let mut key: &[u8] = &[];
             let mut fmt: String;
@@ -922,7 +980,8 @@ mod tests {
     #[test]
     fn insert_at_49th() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(10, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             let key = "aba".as_bytes();
             let value = 64;
@@ -951,7 +1010,8 @@ mod tests {
     #[test]
     fn remove_at_49th() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(10, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(10, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             let mut key: &[u8] = &[];
             let mut fmt: String;
@@ -977,7 +1037,8 @@ mod tests {
     #[test]
     fn insert_multi_level() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(10, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(10, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             let key = vec![1, 2, 3];
             let value = 64;
@@ -1021,7 +1082,8 @@ mod tests {
     fn insert_words() {
         in_temp_dir!(|path: String| {
             for _ in 0..10 {
-                let tree = Dart::<u64>::new(5, 5, path.clone() + "/tree", path.clone() + "/wal");
+                let config = NodeCacheConfig::new(5, 5, path.clone() + "/tree");
+                let tree = Dart::<u64>::new(config);
 
                 tree.upsert("apple".as_bytes(), 1).unwrap();
                 tree.upsert("appetizer".as_bytes(), 2).unwrap();
@@ -1063,7 +1125,8 @@ mod tests {
     #[test]
     fn insert_overlap_at_extremes() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             let k1 = &[0, 1, 2, 3, 4];
             let k2 = &[0, 1, 2, 3, 4, 5, 6, 7];
@@ -1080,7 +1143,8 @@ mod tests {
     #[test]
     fn insert_deep() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             let mut prev_key = Vec::<u8>::new();
 
@@ -1106,12 +1170,8 @@ mod tests {
         use std::thread;
         in_temp_dir!(|path: String| {
             for _i in 0..10 {
-                let tree = Arc::new(Dart::<u64>::new(
-                    10,
-                    1,
-                    path.clone() + "/tree",
-                    path.clone() + "/wal",
-                ));
+                let config = NodeCacheConfig::new(10, 1, path.clone() + "/tree");
+                let tree = Arc::new(Dart::<u64>::new(config));
 
                 let ref1 = tree.clone();
                 let ref2 = tree.clone();
@@ -1172,7 +1232,9 @@ mod tests {
     fn insert_words_permutations() {
         for _ in 0..100 {
             in_temp_dir!(|path: String| {
-                let tree = Dart::<u64>::new(1, 1, path.clone() + "/tree", path.clone() + "/wal");
+                let config = NodeCacheConfig::new(1, 1, path.clone() + "/tree");
+                let tree = Dart::<u64>::new(config);
+
                 let mut words = vec![
                     "apple",
                     "apply",
@@ -1227,7 +1289,9 @@ mod tests {
     #[test]
     fn insert_breaking() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(1, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(1, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
+
             tree.upsert("bark".as_bytes(), 1).unwrap();
             tree.upsert("arrange".as_bytes(), 1).unwrap();
             tree.upsert("arc".as_bytes(), 1).unwrap();
@@ -1268,7 +1332,8 @@ mod tests {
     #[test]
     fn insert_deep_and_wide() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(10000, 5, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(10000, 5, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             for i in 0..=255 {
                 let level_vec: Vec<u8> = (0..=i).collect();
@@ -1290,7 +1355,8 @@ mod tests {
     #[test]
     fn get_element_when_exists() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             for i in 0..10 {
                 let level_vec: Vec<u8> = (0..=i).collect();
@@ -1315,7 +1381,8 @@ mod tests {
     #[test]
     fn get_element_when_not_exists() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(100, 1, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(100, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             for i in 0..10 {
                 let level_vec: Vec<u8> = (0..=i).collect();
@@ -1347,7 +1414,8 @@ mod tests {
     #[test]
     fn insert_terminal_remove_terminal_insert_terminal() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(5, 1, path.clone() + "/tree", path.clone() + "/wal");
+            let config = NodeCacheConfig::new(5, 1, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             for i in 0..=10 {
                 let level_vec: Vec<u8> = (0..i).collect();
@@ -1382,7 +1450,8 @@ mod tests {
     #[test]
     fn get_on_insert() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(10000, 5, path.clone() + "/tree", path + "/wal");
+            let config = NodeCacheConfig::new(10000, 5, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             for i in 0..=255 {
                 let level_vec: Vec<u8> = (0..=i).collect();
@@ -1427,7 +1496,8 @@ mod tests {
     #[test]
     fn insert_many_random_removal() {
         in_temp_dir!(|path: String| {
-            let tree = Dart::<u64>::new(60000, 5, path.clone() + "/tree", path.clone() + "/wal");
+            let config = NodeCacheConfig::new(60000, 5, path.clone() + "/tree");
+            let tree = Dart::<u64>::new(config);
 
             for i in 0..=255 {
                 let level_vec: Vec<u8> = (0..=i).collect();
