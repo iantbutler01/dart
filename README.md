@@ -45,10 +45,11 @@ If all of the above wasn't enough I created a generational version of DART -- GD
 ### Example
 
 ```rust
-use dart::generational::GDart;
+use dart::generational::{GDart, GDartConfig};
 
 //Max generation size, LRU Size for a generation, LRU Segments, Path for all writes
-let mut tree = GDart::<u64>::new(5000, 1000, 5, Some(path));
+let config = GDartConfig::new(5000, 1000, 5, Some(path));
+let mut tree = GDart::<u64>::new(config);
 
 tree.upsert(&[1, 2, 3, 4], 64)
 let res = tree.get(&[1, 2, 3, 4]);
