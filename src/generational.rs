@@ -1,4 +1,5 @@
 use crate::node::NodeCacheConfig;
+use crate::tree::DartSnapshot;
 use crate::{errors::Errors, tree::Dart};
 use bincode::{Decode, Encode};
 use rayon::prelude::*;
@@ -9,6 +10,60 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::thread::JoinHandle;
 
+pub struct GDartSnapshot {
+    pub current_generation: DartSnapshot,
+    pub past_generations: Vec<DartSnapshot>,
+    pub current_generation_number: u64,
+    pub config: GDartConfig,
+}
+
+impl GDartSnapshot {
+    pub fn new<T: Encode + Decode + Send + Sync + Clone + Debug>(
+        gdart: &'_ GDart<T>,
+    ) -> Result<GDartSnapshot, Box<dyn std::error::Error>> {
+        Ok(Self {
+            current_generation: gdart.current_generation.snapshot()?,
+            past_generations: gdart
+                .past_generations
+                .write()
+                .expect("Expected to acquire writer.")
+                .iter()
+                .map(|gen| {
+                    gen.snapshot()
+                        .expect("Expected to snapshot a past generation.")
+                })
+                .collect(),
+            current_generation_number: gdart.current_generation_number.load(Ordering::SeqCst),
+            config: gdart.config.clone(),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct GDartConfig {
+    max_single_generation_size: u64,
+    max_single_generation_lru_size: u64,
+    num_single_generation_lru_segments: usize,
+    write_path: String,
+}
+impl GDartConfig {
+    pub fn new(
+        max_single_generation_size: u64,
+        max_single_generation_lru_size: u64,
+        num_single_generation_lru_segments: usize,
+        write_path: Option<String>,
+    ) -> Self {
+        let write_path = write_path.unwrap_or(".gdart".to_string());
+
+        Self {
+            max_single_generation_size,
+            max_single_generation_lru_size,
+            num_single_generation_lru_segments,
+            write_path,
+        }
+    }
+}
+
 pub struct GDart<T: 'static + Encode + Decode>
 where
     T: Send + Sync + Clone + Debug,
@@ -16,38 +71,63 @@ where
     current_generation: Arc<Dart<T>>,
     current_generation_number: AtomicU64,
     past_generations: Arc<RwLock<VecDeque<Arc<Dart<T>>>>>,
-    max_single_generation_size: u64,
-    max_single_generation_lru_size: u64,
-    num_single_generation_lru_segments: usize,
-    write_path: String,
+    config: GDartConfig,
     merge_thread: Option<JoinHandle<()>>,
 }
 
 impl<T: 'static + Encode + Decode + Send + Sync + Clone + Debug> GDart<T> {
-    pub fn new(
-        max_single_generation_size: u64,
-        max_single_generation_lru_size: u64,
-        num_single_generation_lru_segments: usize,
-        write_path: Option<String>,
-    ) -> Self {
+    pub fn new(config: GDartConfig) -> Self {
         let mut dart_cache_config = NodeCacheConfig::default();
-        dart_cache_config.max_lru_cap = max_single_generation_lru_size;
-        dart_cache_config.num_lru_segments = num_single_generation_lru_segments;
+        dart_cache_config.max_lru_cap = config.max_single_generation_lru_size;
+        dart_cache_config.num_lru_segments = config.num_single_generation_lru_segments;
 
-        let write_path = write_path.unwrap_or(".gdart".to_string());
-        let first_generation_write_path = write_path.clone() + "/0";
+        let first_generation_write_path = config.write_path.clone() + "/0";
         dart_cache_config.disk_path = first_generation_write_path;
 
         Self {
-            max_single_generation_size,
-            write_path: write_path.clone(),
             past_generations: Arc::new(RwLock::new(VecDeque::<_>::with_capacity(100))),
-            max_single_generation_lru_size,
-            num_single_generation_lru_segments,
             current_generation_number: AtomicU64::new(0),
             current_generation: Arc::new(Dart::<T>::new(dart_cache_config)),
+            config,
             merge_thread: None,
         }
+    }
+
+    pub fn snapshot(&mut self) -> Result<GDartSnapshot, Box<dyn std::error::Error>> {
+        if self.merge_thread.is_some() {
+            self.merge_thread
+                .take()
+                .unwrap()
+                .join()
+                .expect("Expected to join merge thread.");
+        };
+
+        GDartSnapshot::new(&self)
+    }
+
+    pub fn from_snapshot(
+        snapshot: GDartSnapshot,
+        warm: bool,
+    ) -> Result<GDart<T>, Box<dyn std::error::Error>> {
+        let current = Dart::from_snapshot(snapshot.current_generation, warm);
+        let past_gens = snapshot
+            .past_generations
+            .iter()
+            .map(|snap| {
+                Arc::new(
+                    Dart::from_snapshot(snap.clone(), warm)
+                        .expect("Expected to load individual past gen from snapshot."),
+                )
+            })
+            .collect();
+
+        Ok(GDart {
+            current_generation: Arc::new(current?),
+            past_generations: Arc::new(RwLock::new(past_gens)),
+            current_generation_number: AtomicU64::new(snapshot.current_generation_number),
+            config: snapshot.config,
+            merge_thread: None,
+        })
     }
 
     fn merge_past_generations(&mut self) {
@@ -137,12 +217,14 @@ impl<T: 'static + Encode + Decode + Send + Sync + Clone + Debug> GDart<T> {
             .fetch_add(1 as u64, Ordering::SeqCst)
             + 1;
 
-        let new_gen_write_path =
-            self.write_path.clone() + "/" + next_gen_number.clone().to_string().as_str() + "/disk";
+        let new_gen_write_path = self.config.write_path.clone()
+            + "/"
+            + next_gen_number.clone().to_string().as_str()
+            + "/disk";
 
         let dart_cache_config = NodeCacheConfig::new(
-            self.max_single_generation_lru_size,
-            self.num_single_generation_lru_segments,
+            self.config.max_single_generation_lru_size,
+            self.config.num_single_generation_lru_segments,
             new_gen_write_path,
         );
 
@@ -172,7 +254,7 @@ impl<T: 'static + Encode + Decode + Send + Sync + Clone + Debug> GDart<T> {
             .count
             .load(std::sync::atomic::Ordering::SeqCst);
 
-        if gen_count >= self.max_single_generation_size {
+        if gen_count >= self.config.max_single_generation_size {
             self.next_generation();
         }
 
@@ -256,16 +338,19 @@ impl<T: Send + Sync + Clone + Encode + Decode + Debug> Drop for GDart<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{generational::GDart, utils::in_temp_dir};
+    use crate::{
+        generational::{GDart, GDartConfig},
+        utils::in_temp_dir,
+    };
 
     #[test]
     fn create_gdart() {
         in_temp_dir!(|path| {
-            let gdart: GDart<u64> = GDart::new(100, 50, 5, Some(path));
+            let config = GDartConfig::new(100, 50, 5, Some(path));
+            let tree = GDart::<u64>::new(config);
 
             assert_eq!(
-                gdart
-                    .current_generation_number
+                tree.current_generation_number
                     .load(std::sync::atomic::Ordering::SeqCst),
                 0
             )
@@ -275,7 +360,8 @@ mod tests {
     #[test]
     fn insert_words() {
         in_temp_dir!(|path: String| {
-            let mut tree = GDart::<u64>::new(3, 10, 1, Some(path));
+            let config = GDartConfig::new(3, 10, 1, Some(path.clone()));
+            let mut tree = GDart::<u64>::new(config);
 
             tree.upsert("apple".as_bytes(), 1).unwrap();
             tree.upsert("appetizer".as_bytes(), 2).unwrap();
@@ -314,7 +400,8 @@ mod tests {
     #[test]
     fn insert_deep_and_wide() {
         in_temp_dir!(|path: String| {
-            let mut tree = GDart::<u64>::new(5000, 1000, 5, Some(path.clone()));
+            let config = GDartConfig::new(5000, 1000, 5, Some(path.clone()));
+            let mut tree = GDart::<u64>::new(config);
 
             for i in 0..=255 {
                 let level_vec: Vec<u8> = (0..=i).collect();
@@ -336,7 +423,8 @@ mod tests {
     #[test]
     fn get_on_insert() {
         in_temp_dir!(|path: String| {
-            let mut tree = GDart::<u64>::new(5000, 1000, 5, Some(path));
+            let config = GDartConfig::new(5000, 1000, 5, Some(path));
+            let mut tree = GDart::<u64>::new(config);
 
             for i in 0..=255 {
                 let level_vec: Vec<u8> = (0..=i).collect();

@@ -66,6 +66,7 @@ impl<T: Encode + Decode> Op<T> {
     }
 }
 
+#[derive(Clone)]
 pub struct NodeCacheConfig {
     pub max_lru_cap: u64,
     pub num_lru_segments: usize,
@@ -104,6 +105,8 @@ pub(crate) struct NodeCache<T: 'static> {
 
 impl<T: 'static> Drop for NodeCache<T> {
     fn drop(&mut self) {
+        self.block_until_writes_flushed();
+
         self.thread_exit_signal
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -117,16 +120,81 @@ impl<T: 'static> Drop for NodeCache<T> {
     }
 }
 
+impl<T: 'static> NodeCache<T> {
+    pub(crate) fn block_until_writes_flushed(&self) {
+        loop {
+            let wc = self
+                .write_cache
+                .lock()
+                .expect("Expected to acquire write cache lock.");
+
+            if wc.len() == 0 {
+                self.disk_maintenance()
+                    .expect("Expected disk maintenence to succeed.");
+                self.disk_sync().expect("Expected fsync to complete.");
+
+                drop(wc);
+                break;
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            drop(wc);
+        }
+    }
+
+    pub(crate) fn disk_maintenance(&self) -> Result<usize, std::io::Error> {
+        self.disk.maintenance()
+    }
+
+    pub(crate) fn disk_sync(&self) -> std::io::Result<()> {
+        self.disk.sync_all()
+    }
+
+    pub(crate) fn remove(&self, id: u64) -> Option<NodeWrapper<T>> {
+        self.lru.remove(&id)
+    }
+
+    pub(crate) fn insert(&self, id: u64, value: NodeWrapper<T>) {
+        self.lru.insert(id, value)
+    }
+}
+
+impl<T: 'static + Encode + Decode> NodeCache<T> {
+    pub(crate) fn write_disk(
+        &self,
+        id: u64,
+        node: Option<ArtNode<T>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = node.map(|x| {
+            bincode::encode_to_vec(x, config::standard())
+                .expect("Expected encoding for disk write to succeed.")
+        });
+
+        self.write_cache
+            .lock()
+            .expect("Expected to acquire lock.")
+            .push_front((id, encoded));
+
+        Ok(())
+    }
+}
+
 impl<T: 'static + Encode + Decode + Clone> Default for NodeCache<T> {
     fn default() -> Self {
         NodeCache::<T>::new(NodeCacheConfig::default())
     }
 }
 
-impl<T: 'static + Encode + Decode> NodeCache<T>
-where
-    T: Clone,
-{
+impl<T: 'static + Encode + Decode + Clone> NodeCache<T> {
+    pub(crate) fn get_node_raw(&self, id: &u64) -> Option<ArtNode<T>> {
+        let wrapper = self.get_internal(id, false);
+
+        wrapper.map(|w| w.data.write().unwrap().clone())
+    }
+}
+
+impl<T: 'static + Encode + Decode> NodeCache<T> {
     pub(crate) fn new(config: NodeCacheConfig) -> Self {
         let exit_signal = Arc::new(AtomicBool::new(false));
         let signal_clone2 = exit_signal.clone();
@@ -187,7 +255,6 @@ where
 
         let lru = SegmentedCache::builder(config.num_lru_segments)
             .max_capacity(config.max_lru_cap)
-            // .eviction_listener(eviction_listener)
             .build();
 
         Self {
@@ -198,28 +265,6 @@ where
             threads: [Some(write_handle)],
             thread_exit_signal: exit_signal.clone(),
         }
-    }
-
-    pub(crate) fn write_disk(
-        &self,
-        id: u64,
-        node: Option<ArtNode<T>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let encoded = node.map(|x| {
-            bincode::encode_to_vec(x, config::standard())
-                .expect("Expected encoding for disk write to succeed.")
-        });
-
-        self.write_cache
-            .lock()
-            .expect("Expected to acquire lock.")
-            .push_front((id, encoded));
-
-        Ok(())
-    }
-
-    pub(crate) fn disk_maintenance(&self) -> Result<usize, std::io::Error> {
-        self.disk.maintenance()
     }
 
     pub(crate) fn get(&self, id: &u64) -> Option<NodeWrapper<T>> {
@@ -246,12 +291,6 @@ where
             drop(wc_lock);
             return wrapper_opt;
         }
-    }
-
-    pub(crate) fn get_node_raw(&self, id: &u64) -> Option<ArtNode<T>> {
-        let wrapper = self.get_internal(id, false);
-
-        wrapper.map(|w| w.data.write().unwrap().clone())
     }
 
     fn load(
@@ -282,14 +321,6 @@ where
 
             NodeWrapper::new(node)
         })
-    }
-
-    pub(crate) fn remove(&self, id: u64) -> Option<NodeWrapper<T>> {
-        self.lru.remove(&id)
-    }
-
-    pub(crate) fn insert(&self, id: u64, value: NodeWrapper<T>) {
-        self.lru.insert(id, value)
     }
 }
 

@@ -14,13 +14,31 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-pub struct Dart<T: 'static + Encode + Decode> {
+#[derive(Clone)]
+pub struct DartSnapshot {
+    pub cache_config: NodeCacheConfig,
+    pub count: u64,
+    pub generation: u64,
+    pub levels: usize,
+}
+
+impl DartSnapshot {
+    pub fn new<T: Encode + Decode + Clone>(dart: &Dart<T>) -> Self {
+        Self {
+            cache_config: dart.cache.lock().unwrap().config.clone(),
+            count: dart.count.load(Ordering::SeqCst),
+            generation: dart.generation.load(Ordering::SeqCst),
+            levels: dart.levels.load(Ordering::SeqCst),
+        }
+    }
+}
+
+pub struct Dart<T: 'static + Encode + Decode + Clone> {
     pub(crate) root: AtomicCell<NodePtr>,
     pub(crate) cache: Arc<Mutex<NodeCache<T>>>,
     pub generation: AtomicU64,
     pub count: AtomicU64,
     pub levels: AtomicUsize,
-    pub ops: AtomicUsize,
 }
 
 pub(crate) struct NodeIter<T: Clone + Encode + Decode> {
@@ -43,8 +61,8 @@ impl<T: Clone + Encode + Decode> Iterator for NodeIter<T> {
     }
 }
 
-unsafe impl<T: 'static + Encode + Decode> Sync for Dart<T> {}
-unsafe impl<T: 'static + Encode + Decode> Send for Dart<T> {}
+unsafe impl<T: 'static + Encode + Decode + Clone> Sync for Dart<T> {}
+unsafe impl<T: 'static + Encode + Decode + Clone> Send for Dart<T> {}
 
 impl<T: Encode + Decode + Clone> Default for Dart<T> {
     fn default() -> Self {
@@ -65,7 +83,6 @@ where
             generation: AtomicU64::new(0),
             count: AtomicU64::new(1),
             levels: AtomicUsize::new(0),
-            ops: AtomicUsize::new(0),
         };
 
         let root = tree.new_node(&[], NodeSize::TwoFiftySix);
@@ -609,6 +626,7 @@ where
 
         ptr
     }
+
     fn new_node(&self, prefix: &[u8], size: NodeSize) -> NodePtr {
         let node = ArtNode::<T>::new(
             prefix,
@@ -635,7 +653,21 @@ where
         ptr
     }
 
-    pub(crate) fn iter_nodes(&self) -> impl Iterator<Item = Option<ArtNode<T>>> {
+    pub fn flush(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let cache = self.cache.lock().expect("Expected to acquire disk write");
+
+        cache.block_until_writes_flushed();
+
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> Result<DartSnapshot, Box<dyn std::error::Error>> {
+        self.flush()?;
+
+        Ok(DartSnapshot::new(&self))
+    }
+
+    pub fn iter_nodes(&self) -> impl Iterator<Item = Option<ArtNode<T>>> {
         let cache = self.cache.lock().expect("Expected to acquire cache lock.");
 
         let mut queue: VecDeque<NodePtr> = VecDeque::new();
@@ -677,7 +709,25 @@ where
         NodeIter::new(node_vec)
     }
 
-    pub fn load_root(&self, count: u64, generation: u64, warm: bool) -> Result<(), Errors> {
+    pub fn from_snapshot(
+        snapshot: DartSnapshot,
+        warm: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let dart = Dart::new(snapshot.cache_config);
+
+        dart.count.store(snapshot.count, Ordering::SeqCst);
+        dart.generation.store(snapshot.generation, Ordering::SeqCst);
+        dart.root.store(NodePtr {
+            id: 1,
+            generation: snapshot.generation,
+        });
+
+        dart.load(warm)?;
+
+        Ok(dart)
+    }
+
+    pub fn load(&self, warm: bool) -> Result<(), Errors> {
         let cache = self.cache.lock().expect("Expected to acquire cache lock.");
 
         let root = cache.get(&1);
@@ -685,9 +735,6 @@ where
         if root.is_none() {
             return Err(Errors::EmptyTreeError);
         }
-
-        self.count.store(count, Ordering::SeqCst);
-        self.root.store(NodePtr { id: 1, generation });
 
         // For now implementing a random walk until I can get something in here for data access patterns.
         if warm {
